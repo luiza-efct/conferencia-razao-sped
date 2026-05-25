@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conferência Razão × SPED — HUB EFCT</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Exo+2:wght@200;300;400;500;600;700;800;900&display=swap');
+:root{
+  /* Paleta oficial EFCT — espelha o HUB e ferramentas irmãs (ex.: cálculo-exclusão-icms-c175) */
+  --header-bar:#1F2937;       /* barra escura do header EFCT */
+  --azul-petroleo:#0C2B38;    /* azul oficial — textos de destaque e ícones */
+  --azul-petroleo-2:#15394a;
+  --verde-oliva:#B3BC2B;      /* verde-limão oficial */
+  --verde-oliva-2:#9ba424;    /* hover do verde */
+  --bg:#f4f5ef;               /* off-white com leve tom esverdeado */
+  --card:#ffffff;
+  --texto:#0e1a20;
+  --texto-2:#5a6a72;
+  --borda:#e3e5d8;            /* borda subtle com tom esverdeado */
+  --erro:#a3261a;
+  --erro-bg:#fdecea;
+  --sucesso:#2b6b1e;
+  --sucesso-bg:#eaf5e6;
+  --aviso:#a05a00;
+  --aviso-bg:#fff4e0;
+  --card-bg-soft:#fafbf4;
+  --card-bg-hover:#f3f5e0;
+  --card-info-bg:#eef0e2;
+  /* aliases retrocompat */
+  --efct-lime:var(--verde-oliva);
+  --efct-lime-dark:var(--verde-oliva-2);
+  --efct-lime-soft:var(--card-info-bg);
+  --efct-dark:var(--azul-petroleo);
+  --efct-blue:var(--verde-oliva);
+  --bg-old:var(--bg);
+  --card-old:var(--card);
+  --text:var(--texto);
+  --muted:var(--texto-2);
+  --border:var(--borda);
+  --success:var(--sucesso);
+  --warning:var(--aviso);
+  --danger:var(--erro);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:'Exo 2', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background:var(--bg);
+  color:var(--texto);
+  font-size:16px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+header.hub{
+  background:var(--header-bar);
+  color:#fff;
+  padding:14px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:16px;
+  box-shadow:0 2px 6px rgba(0,0,0,.15);
+  flex-wrap:wrap;
+}
+header.hub .brand{
+  display:flex; align-items:center; gap:12px;
+  font-weight:600; letter-spacing:.3px; font-size:15px;
+}
+header.hub .brand .sep{ color:var(--verde-oliva); font-weight:300; opacity:.7; margin:0; }
+header.hub .brand .tool{ font-weight:500; }
+header.hub a.back{
+  color:#fff;
+  text-decoration:none;
+  font-size:14px;
+  padding:6px 14px;
+  border:1px solid rgba(255,255,255,.25);
+  border-radius:6px;
+  background:transparent;
+  text-transform:none;
+  letter-spacing:0;
+  font-weight:400;
+  transition:all .15s ease;
+}
+header.hub a.back:hover{ background:rgba(255,255,255,.08); border-color:var(--verde-oliva); transform:none; }
+
+main{ max-width:880px; margin:0 auto; padding:36px 24px 60px; }
+
+.intro{
+  margin-bottom:28px; background:transparent; box-shadow:none;
+  border:none; padding:0; position:static;
+}
+.intro h1{
+  font-size:28px; font-weight:600; margin-bottom:8px;
+  color:var(--azul-petroleo); letter-spacing:0; line-height:1.25;
+  display:flex; align-items:center; gap:12px;
+}
+.intro h1 .emoji{ font-size:32px; }
+.intro p{ color:var(--texto-2); font-size:15px; max-width:680px; line-height:1.55; }
+.intro .badge{
+  display:inline-block; background:var(--verde-oliva); color:var(--azul-petroleo);
+  font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.5px;
+  padding:2px 7px; border-radius:4px; margin-bottom:12px;
+}
+
+.card{
+  background:var(--card); border-radius:12px;
+  box-shadow:0 4px 14px rgba(0,28,38,.06);
+  border:1px solid var(--borda); padding:28px;
+  margin-bottom:20px;
+}
+.card h2{
+  font-size:18px; font-weight:600; color:var(--azul-petroleo);
+  margin-bottom:14px; display:flex; align-items:center; gap:8px;
+}
+.card h2::before{
+  content:""; display:inline-block; width:4px; height:18px;
+  background:var(--verde-oliva); border-radius:2px;
+}
+
+.section-title{
+  font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.6px;
+  color:var(--azul-petroleo); margin:24px 0 12px;
+  display:flex; align-items:center; gap:8px;
+}
+.section-title::before{
+  content:""; display:inline-block; width:4px; height:14px;
+  background:var(--verde-oliva); border-radius:2px;
+}
+.upload-grid{
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px;
+}
+.upload-card{
+  display:block;
+  background:var(--card-bg-soft);
+  border:2px dashed var(--borda);
+  border-radius:10px;
+  padding:24px 18px;
+  text-align:left;
+  transition:all .2s ease;
+  cursor:pointer;
+  position:relative;
+}
+.upload-card:hover{ border-color:var(--verde-oliva); background:var(--card-bg-hover); }
+.upload-card.dragover{ border-color:var(--verde-oliva); background:var(--card-bg-hover); }
+.upload-card.loaded{
+  border-style:solid; border-color:var(--verde-oliva); background:var(--card-info-bg);
+}
+.upload-card .role{
+  display:inline-block; font-size:10px; font-weight:700;
+  text-transform:uppercase; letter-spacing:.5px;
+  color:var(--azul-petroleo); background:var(--verde-oliva);
+  padding:2px 7px; border-radius:4px; margin-bottom:10px;
+}
+.upload-card.matriz{ border-style:solid; border-color:var(--verde-oliva); }
+.upload-card .title{ font-size:14px; font-weight:600; color:var(--azul-petroleo); margin-bottom:4px; }
+.upload-card .desc{ font-size:12.5px; color:var(--texto-2); margin-bottom:12px; min-height:32px; line-height:1.45; }
+.upload-card .filename{ font-size:13px; font-weight:500; color:var(--azul-petroleo); word-break:break-all; margin-bottom:2px; }
+.upload-card .filesize{ font-size:11px; color:var(--texto-2); }
+.upload-card.loaded .filename:before{ content:'✓ '; color:var(--verde-oliva-2); font-weight:700; }
+.upload-card input[type=file]{ display:none; }
+.upload-card .placeholder{ font-size:12.5px; color:var(--texto-2); font-style:italic; }
+.upload-card .clear{
+  position:absolute; top:10px; right:10px; background:transparent; border:none;
+  color:var(--texto-2); cursor:pointer; font-size:18px; padding:0 6px; line-height:1; display:none;
+}
+.upload-card.loaded .clear{ display:block; }
+.upload-card .clear:hover{ color:var(--erro); }
+
+.actions{ display:flex; gap:12px; align-items:center; margin-top:18px; flex-wrap:wrap; }
+button.primary, button.primario{
+  background:var(--verde-oliva); color:var(--azul-petroleo);
+  border:0; padding:12px 24px; border-radius:8px;
+  font-size:15px; font-weight:600; font-family:inherit;
+  cursor:pointer; transition:all .15s ease; letter-spacing:.3px;
+}
+button.primary:hover:not(:disabled){ background:var(--verde-oliva-2); transform:translateY(-1px); box-shadow:none; }
+button.primary:disabled{ background:#D1D5DB; cursor:not-allowed; color:#6B7280; opacity:.5; }
+button.secondary, button.secundario{
+  background:transparent; color:var(--azul-petroleo);
+  border:1px solid var(--borda); padding:12px 20px;
+  border-radius:8px; font-size:14px; font-weight:500;
+  font-family:inherit; cursor:pointer;
+}
+button.secondary:hover{ background:var(--card-info-bg); }
+
+.status-bar{ margin-top:14px; font-size:13px; color:var(--texto-2); min-height:20px; }
+.status-bar.ok{ color:var(--sucesso); }
+.status-bar.err{ color:var(--erro); }
+
+.results{
+  background:var(--card); border-radius:12px;
+  box-shadow:0 4px 14px rgba(0,28,38,.06);
+  border:1px solid var(--borda);
+  padding:28px; margin-top:24px;
+}
+.results h2{
+  font-size:18px; font-weight:600; color:var(--azul-petroleo);
+  margin-bottom:14px;
+  display:flex; align-items:center; gap:8px; letter-spacing:0;
+}
+.results h2::before{
+  content:""; display:inline-block; width:4px; height:18px;
+  background:var(--verde-oliva); border-radius:2px;
+}
+.stats{
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:12px; margin-bottom:18px;
+}
+.stat{
+  background:var(--card-bg-soft); border:1px solid var(--borda);
+  border-radius:10px; padding:14px 16px;
+}
+.stat .label{
+  font-size:12px; color:var(--texto-2); text-transform:uppercase;
+  letter-spacing:.5px; margin-bottom:4px; font-weight:500;
+}
+.stat .value{ font-size:22px; font-weight:600; color:var(--azul-petroleo); letter-spacing:0; }
+.stat .sub{ font-size:11px; color:var(--texto-2); margin-top:3px; }
+.stat.destaque{ background:var(--azul-petroleo); border-color:var(--azul-petroleo); }
+.stat.destaque .label{ color:rgba(255,255,255,.7); }
+.stat.destaque .value{ color:var(--verde-oliva); }
+.stat.success, .stat.ok{ background:var(--sucesso-bg); border-color:#b9dbb1; }
+.stat.success .value, .stat.ok .value{ color:var(--sucesso); }
+.stat.warning, .stat.aviso{ background:var(--aviso-bg); border-color:#f1d4a0; }
+.stat.warning .value, .stat.aviso .value{ color:var(--aviso); }
+.stat.danger, .stat.erro{ background:var(--erro-bg); border-color:#f5c2bd; }
+.stat.danger .value, .stat.erro .value{ color:var(--erro); }
+
+.legend{
+  display:flex; gap:14px; flex-wrap:wrap; font-size:12px;
+  color:var(--texto-2); margin:6px 0 16px;
+}
+.legend .item{ display:flex; align-items:center; gap:6px; }
+.legend .swatch{ width:14px; height:14px; border-radius:3px; border:1px solid var(--borda); }
+.legend .sw-ok{ background:var(--sucesso-bg); border-color:#b9dbb1; }
+.legend .sw-warn{ background:var(--aviso-bg); border-color:#f1d4a0; }
+.legend .sw-err{ background:var(--erro-bg); border-color:#f5c2bd; }
+.legend .sw-info{ background:var(--card-info-bg); }
+
+.log{
+  background:var(--azul-petroleo); color:#cdd6db;
+  font-family:'Consolas','Courier New',monospace;
+  font-size:12px; padding:12px 14px; border-radius:8px;
+  max-height:220px; overflow:auto; margin-top:14px;
+  white-space:pre-wrap; word-break:break-word;
+  border:1px solid var(--azul-petroleo-2);
+}
+.log .ok{ color:#c9d96b; }
+.log .warn{ color:#f1d4a0; }
+.log .err{ color:#f5c2bd; }
+.log .info{ color:#a8c5d0; }
+
+.progress-overlay{
+  position:fixed; inset:0; background:rgba(12,43,56,.55);
+  display:none; align-items:center; justify-content:center; z-index:50;
+}
+.progress-overlay.active{ display:flex; }
+.progress-box{
+  background:#fff; padding:28px 32px; border-radius:12px; text-align:center;
+  min-width:320px; box-shadow:0 10px 40px rgba(0,28,38,.2);
+  border:1px solid var(--borda);
+}
+.progress-box .spinner{
+  width:36px; height:36px; border:3px solid var(--borda); border-top-color:var(--verde-oliva);
+  border-radius:50%; margin:0 auto 14px; animation:spin 1s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.progress-box .msg{ font-size:14px; color:var(--azul-petroleo); font-weight:600; }
+.progress-box .sub{ font-size:12px; color:var(--texto-2); margin-top:6px; }
+.progress-bar{
+  width:100%; height:6px; background:var(--borda); border-radius:3px; overflow:hidden; margin-top:14px;
+}
+.progress-bar .fill{
+  height:100%; background:var(--verde-oliva); width:0; transition:width .2s ease;
+}
+
+/* Modal */
+.modal-overlay{
+  position:fixed; inset:0; background:rgba(12,43,56,.6); display:none;
+  align-items:center; justify-content:center; z-index:60; padding:24px;
+}
+.modal-overlay.active{ display:flex; }
+.modal-box{
+  background:#fff; border-radius:12px; padding:28px;
+  max-width:720px; width:100%; max-height:88vh; overflow:auto;
+  box-shadow:0 20px 60px rgba(0,28,38,.25);
+  border:1px solid var(--borda);
+}
+.modal-box h3{
+  font-size:18px; font-weight:600; color:var(--azul-petroleo);
+  margin-bottom:8px;
+  display:flex; align-items:center; gap:8px;
+}
+.modal-box h3::before{
+  content:""; display:inline-block; width:4px; height:18px;
+  background:var(--verde-oliva); border-radius:2px;
+}
+.modal-box .lead{ font-size:13px; color:var(--texto-2); margin-bottom:16px; line-height:1.55; }
+.amb-row{
+  display:flex; align-items:center; gap:12px; padding:10px 0;
+  border-bottom:1px dashed var(--borda);
+}
+.amb-row:last-child{ border-bottom:none; }
+.amb-row .info{ flex:1; font-size:13px; }
+.amb-row .info .row-id{ font-weight:600; color:var(--azul-petroleo); }
+.amb-row .info .hist{
+  font-family:'Consolas','Courier New',monospace; font-size:11px; color:var(--texto-2);
+  display:block; margin-top:2px; word-break:break-all;
+}
+.amb-row select{
+  border:1px solid var(--borda); border-radius:6px; padding:6px 10px;
+  font-size:13px; min-width:140px; background:#fff; font-family:inherit;
+  color:var(--azul-petroleo);
+}
+.modal-actions{ display:flex; gap:12px; justify-content:flex-end; margin-top:18px; }
+
+footer{
+  text-align:center; padding:24px; color:var(--texto-2); font-size:12px;
+  margin-top:32px;
+}
+footer .area-tag{
+  display:inline-block; background:var(--azul-petroleo); color:var(--verde-oliva);
+  padding:2px 10px; border-radius:10px; font-size:11px; margin-left:6px;
+  font-weight:500; letter-spacing:.4px;
+}
+footer strong{ color:var(--azul-petroleo); font-weight:600; }
+footer a{ color:var(--azul-petroleo); text-decoration:none; font-weight:500; }
+
+details.howto{
+  margin-top:14px; background:var(--card-bg-soft);
+  border:1px solid var(--borda); border-left:3px solid var(--verde-oliva);
+  border-radius:10px; padding:14px 18px; font-size:13.5px;
+}
+details.howto summary{
+  cursor:pointer; font-weight:600; color:var(--azul-petroleo);
+  list-style:none;
+}
+details.howto summary::-webkit-details-marker{ display:none; }
+details.howto[open] summary{ margin-bottom:10px; padding-bottom:10px; border-bottom:1px dashed var(--borda); }
+details.howto ol{ padding-left:22px; color:var(--texto-2); line-height:1.6; }
+details.howto ol li{ margin:6px 0; }
+details.howto code{
+  background:var(--card-info-bg); padding:1px 6px; border-radius:4px;
+  font-size:12.5px; font-family:'Consolas','Courier New',monospace;
+  color:var(--azul-petroleo);
+}
+details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
+
+@media (max-width:600px){
+  header.hub{ padding:12px 16px; flex-direction:column; gap:10px; align-items:flex-start; }
+  header.hub .brand{ font-size:14px; }
+  main{ padding:24px 16px 40px; }
+  .intro h1{ font-size:22px; }
+  .stat .value{ font-size:18px; }
+}
+</style>
+</head>
+<body>
+
+<header class="hub">
+  <div class="brand">
+    HUB EFCT <span class="sep">|</span> <span class="tool">Conferência Razão × SPED</span>
+  </div>
+  <a class="back" href="https://effect-contratos-api.onrender.com" target="_blank" rel="noopener">← voltar ao HUB</a>
+</header>
+
+<main>
+
+<section class="intro">
+  <span class="badge">Auditoria Fiscal · Triple Check + CNAE + CST</span>
+  <h1><span class="emoji">🔍</span> Conferência Razão × SPED</h1>
+  <p>Faça upload da <strong>Razão Contábil</strong> e dos três blocos SPED. A ferramenta extrai NF e Razão Social do histórico, enriquece <strong>CNPJ + CNAEs</strong> via BrasilAPI, aplica filtro <strong>CST 50–67</strong> nos blocos de contribuições, gera coluna de <strong>análise de divergências</strong> e cria uma <strong>aba consolidada de Pendências por CNPJ</strong>.</p>
+
+  <details class="howto">
+    <summary>Fluxo do Triple Check + CNAE + CST</summary>
+    <ol>
+      <li><strong>Pré-processamento:</strong> extrai NF e Razão Social do "Complemento Histórico" (padrão <code>VlrrefNF{n}VlrrefNF{n}NOME</code>). Em caso de ambiguidade, tenta resolver pela coluna NF original; se não conseguir, pede sua confirmação.</li>
+      <li><strong>Enriquecimento:</strong> identifica CNPJ via mapa Nome↔CNPJ derivado dos SPEDs, e busca <strong>1º e 2º CNAEs</strong> via BrasilAPI (com cache local e fallback CNPJa).</li>
+      <li><strong>Filtro CST 50–67:</strong> em A100 e F100, somente lançamentos com <code>CST Cofins</code> entre 50 e 67 (faixas "Direito a Crédito" e "Crédito Presumido") entram na soma. C100-EFD não recebe esse filtro.</li>
+      <li><strong>Triple Check:</strong>
+        <ul style="margin-left:18px;color:var(--muted)">
+          <li>C100-EFD / A100 → NF + CNPJ + Período</li>
+          <li>F100 → CNPJ + Período + Vlr Operação ≈ Vlr Partida</li>
+        </ul>
+      </li>
+      <li><strong>Análise do Cruzamento:</strong> calcula <code>Vlr Partida − Σ blocos</code> e descreve em qual bloco a NF foi localizada (verde = sem divergência, âmbar = diverge, vermelho = não localizada).</li>
+      <li><strong>Aba "PENDÊNCIAS DE CRUZAMENTO":</strong> consolidação automática por CNPJ de todas as linhas não localizadas — ordenada do maior valor para o menor, com CNAEs e quantidade de lançamentos. Foco da auditoria em uma única visão.</li>
+    </ol>
+  </details>
+</section>
+
+<div class="section-title">1. Planilha Matriz</div>
+<div class="upload-grid">
+  <label class="upload-card matriz" data-key="razao">
+    <span class="role">Matriz</span>
+    <div class="title">Razão Contábil</div>
+    <div class="desc">Arquivo com a aba "RAZÃO CONTABIL". Receberá 9 novas colunas + uma 2ª aba "PENDÊNCIAS DE CRUZAMENTO" agrupada por CNPJ.</div>
+    <div class="filename"><span class="placeholder">Clique ou arraste o arquivo .xlsx</span></div>
+    <div class="filesize"></div>
+    <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+    <button class="clear" type="button" title="Remover">×</button>
+  </label>
+</div>
+
+<div class="section-title">2. Bases de Confronto (SPED)</div>
+<div class="upload-grid">
+  <label class="upload-card" data-key="c100efd">
+    <span class="role">Bloco 1</span>
+    <div class="title">C100 — EFD FISCAL</div>
+    <div class="desc">Bloco C100 da EFD ICMS/IPI. Aceita .xlsx ou .csv (CSV é recomendado para arquivos &gt;10 MB).</div>
+    <div class="filename"><span class="placeholder">Clique ou arraste o arquivo .xlsx</span></div>
+    <div class="filesize"></div>
+    <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+    <button class="clear" type="button" title="Remover">×</button>
+  </label>
+
+  <label class="upload-card" data-key="a100">
+    <span class="role">Bloco 2 · CST 50–67</span>
+    <div class="title">A100 — CONTRI</div>
+    <div class="desc">EFD-Contribuições serviços. Σ BC Cofins apenas dos lançamentos com CST 50–67.</div>
+    <div class="filename"><span class="placeholder">Clique ou arraste o arquivo .xlsx</span></div>
+    <div class="filesize"></div>
+    <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+    <button class="clear" type="button" title="Remover">×</button>
+  </label>
+
+  <label class="upload-card" data-key="f100">
+    <span class="role">Bloco 3 · CST 50–67</span>
+    <div class="title">F100 — CONTRI</div>
+    <div class="desc">Demais operações (frete, depreciação, financeiros). Σ BC Cofins apenas dos lançamentos com CST 50–67.</div>
+    <div class="filename"><span class="placeholder">Clique ou arraste o arquivo .xlsx</span></div>
+    <div class="filesize"></div>
+    <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
+    <button class="clear" type="button" title="Remover">×</button>
+  </label>
+</div>
+
+<div class="actions">
+  <button id="btnProcess" class="primary" disabled>Processar cruzamento</button>
+  <button id="btnReset" class="secondary" type="button">Limpar tudo</button>
+  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer">
+    <input type="checkbox" id="chkSkipCNAE"> Pular busca de CNAE (mais rápido)
+  </label>
+  <span class="status-bar" id="statusBar">Selecione os 4 arquivos para liberar o botão.</span>
+</div>
+
+<section class="results" id="results" hidden>
+  <h2>Resultado do cruzamento</h2>
+  <div class="stats" id="stats"></div>
+
+  <div class="legend">
+    <div class="item"><span class="swatch sw-ok"></span> Valor bate (≤ R$ 100)</div>
+    <div class="item"><span class="swatch sw-warn"></span> Divergência de valor</div>
+    <div class="item"><span class="swatch sw-info"></span> NF / CNPJ / CNAE</div>
+    <div class="item"><span class="swatch sw-err"></span> Alerta (ambíguo / não localizado)</div>
+  </div>
+
+  <button id="btnDownload" class="primary">⬇ Baixar planilha cruzada</button>
+  <div class="log" id="log"></div>
+</section>
+
+</main>
+
+<!-- Progress -->
+<div class="progress-overlay" id="progress">
+  <div class="progress-box">
+    <div class="spinner"></div>
+    <div class="msg" id="progressMsg">Processando…</div>
+    <div class="sub" id="progressSub"></div>
+    <div class="progress-bar" id="progressBar" hidden><div class="fill" id="progressFill"></div></div>
+  </div>
+</div>
+
+<footer>
+  Ferramenta do HUB EFCT — auditoria de duplicidade e conferência de escrituração Razão × SPED <span class="area-tag">FISCAL</span><br>
+  Processamento em <strong>servidor Flask próprio (Render)</strong>. CNAEs consultados via BrasilAPI / CNPJa.
+</footer>
+
+<script>
+/**
+ * HUB EFCT — Conferência Razão × SPED (frontend)
+ * Toda a lógica pesada roda no backend Flask (/api/processar).
+ * O cliente só faz upload, mostra progresso e baixa o resultado.
+ */
+
+const FILES = { razao: null, c100efd: null, a100: null, f100: null };
+
+// --------------- helpers de UI ---------------
+function $(s){ return document.querySelector(s); }
+function $$(s){ return document.querySelectorAll(s); }
+
+function formatBytes(b){
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(2) + ' MB';
+}
+
+function formatBR(n){
+  if (n == null || isNaN(n)) return '';
+  return Number(n).toLocaleString('pt-BR', { minimumFractionDigits:2, maximumFractionDigits:2 });
+}
+
+function pct(n, total){ if (!total) return '0%'; return ((n/total)*100).toFixed(1)+'%'; }
+
+// --------------- upload handlers ---------------
+function attachUpload(card){
+  const input = card.querySelector('input[type=file]');
+  const key = card.dataset.key;
+  const clearBtn = card.querySelector('.clear');
+
+  card.addEventListener('dragover', e => { e.preventDefault(); card.classList.add('dragover'); });
+  card.addEventListener('dragleave', () => card.classList.remove('dragover'));
+  card.addEventListener('drop', e => {
+    e.preventDefault();
+    card.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleFile(key, e.dataTransfer.files[0], card);
+  });
+  input.addEventListener('change', () => {
+    if (input.files.length) handleFile(key, input.files[0], card);
+  });
+  clearBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    FILES[key] = null;
+    input.value = '';
+    card.classList.remove('loaded');
+    card.querySelector('.filename').innerHTML = '<span class="placeholder">Clique ou arraste o arquivo .xlsx</span>';
+    card.querySelector('.filesize').textContent = '';
+    refreshState();
+  });
+}
+
+function handleFile(key, file, card){
+  FILES[key] = file;
+  card.classList.add('loaded');
+  card.querySelector('.filename').textContent = file.name;
+  card.querySelector('.filesize').textContent = formatBytes(file.size);
+  refreshState();
+}
+
+function refreshState(){
+  const ready = FILES.razao && FILES.c100efd && FILES.a100 && FILES.f100;
+  $('#btnProcess').disabled = !ready;
+  const status = $('#statusBar');
+  if (ready){
+    status.textContent = 'Pronto para processar.';
+    status.className = 'status-bar ok';
+  } else {
+    const loaded = Object.values(FILES).filter(Boolean).length;
+    status.textContent = `${loaded} de 4 arquivos carregados.`;
+    status.className = 'status-bar';
+  }
+}
+
+// --------------- progresso ---------------
+function showProgress(msg, sub=''){
+  $('#progressMsg').textContent = msg;
+  $('#progressSub').textContent = sub;
+  $('#progressBar').hidden = true;
+  $('#progressFill').style.width = '0';
+  $('#progress').classList.add('active');
+}
+function setProgress(msg, sub=''){
+  $('#progressMsg').textContent = msg;
+  if (sub !== null && sub !== undefined) $('#progressSub').textContent = sub;
+}
+function hideProgress(){ $('#progress').classList.remove('active'); }
+
+// --------------- core: chamada ao backend ---------------
+async function processAll(){
+  const skipCNAE = $('#chkSkipCNAE') ? $('#chkSkipCNAE').checked : false;
+  showProgress('Enviando arquivos para o servidor…', 'Aguardando processamento (pode levar 10–60s)');
+
+  // simula uma sub-mensagem que vai trocando enquanto o backend processa
+  let tick = 0;
+  const mensagens = [
+    'Lendo Razão Contábil…',
+    'Processando C100-EFD FISCAL…',
+    'Processando A100-CONTRI…',
+    'Processando F100-CONTRI…',
+    'Construindo mapa Nome → CNPJ…',
+    'Buscando CNAEs (BrasilAPI)…',
+    'Aplicando filtro CST 50-67…',
+    'Executando Triple Check…',
+    'Calculando Análise do Cruzamento…',
+    'Consolidando aba PENDÊNCIAS…',
+    'Aplicando padrão visual EFCT…',
+    'Gerando arquivo final…',
+  ];
+  const interval = setInterval(() => {
+    tick = (tick + 1) % mensagens.length;
+    setProgress(mensagens[tick], 'Servidor Flask processando — aguarde');
+  }, 2500);
+
+  try {
+    const fd = new FormData();
+    fd.append('razao', FILES.razao);
+    fd.append('c100efd', FILES.c100efd);
+    fd.append('a100', FILES.a100);
+    fd.append('f100', FILES.f100);
+    fd.append('skip_cnae', skipCNAE ? 'true' : 'false');
+
+    const resp = await fetch('/api/processar', { method: 'POST', body: fd });
+
+    if (!resp.ok){
+      let errMsg = `HTTP ${resp.status}`;
+      try {
+        const errBody = await resp.json();
+        errMsg = errBody.erro || errMsg;
+      } catch {}
+      throw new Error(errMsg);
+    }
+
+    // Pega os headers de stats antes de consumir o body
+    const stats = {};
+    resp.headers.forEach((value, key) => {
+      if (key.toLowerCase().startsWith('x-stat-')){
+        const cleaned = key.replace(/^x-stat-/i, '');
+        stats[cleaned] = isNaN(value) ? value : Number(value);
+      }
+    });
+
+    const blob = await resp.blob();
+    window.__resultBlob = blob;
+    // Nome do arquivo do header Content-Disposition
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const m = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)["']?/i);
+    window.__resultName = m ? decodeURIComponent(m[1]) :
+      (FILES.razao.name.replace(/\.(xlsx|xls|xlsm)$/i, '') + ' - CRUZADO.xlsx');
+
+    clearInterval(interval);
+    hideProgress();
+
+    renderResults(stats);
+    $('#results').hidden = false;
+    $('#results').scrollIntoView({ behavior:'smooth', block:'start' });
+  } catch (err){
+    clearInterval(interval);
+    hideProgress();
+    console.error(err);
+    const msg = err.message || String(err);
+    $('#statusBar').textContent = 'Erro: ' + msg;
+    $('#statusBar').className = 'status-bar err';
+  }
+}
+
+// --------------- resultados ---------------
+function renderResults(stats){
+  const totalLinhas = stats.linhas_razao || 0;
+  const items = [
+    { label:'Linhas na Razão', value: totalLinhas },
+    { label:'Match C100-EFD', value: stats.match_efd || 0, sub: pct(stats.match_efd, totalLinhas) },
+    { label:'Match A100', value: stats.match_a100 || 0, sub: pct(stats.match_a100, totalLinhas) },
+    { label:'Match F100', value: stats.match_f100 || 0, sub: pct(stats.match_f100, totalLinhas) },
+    { label:'Com pelo menos 1 match', value: stats.match_any || 0, sub: pct(stats.match_any, totalLinhas), cls:'success' },
+    { label:'Sem divergência', value: stats.sem_divergencia || 0, sub: pct(stats.sem_divergencia, totalLinhas), cls:'success' },
+    { label:'Com divergência', value: (stats.div_efd||0)+(stats.div_a100||0)+(stats.div_f100||0),
+      sub: `${stats.div_efd||0}+${stats.div_a100||0}+${stats.div_f100||0}`,
+      cls: ((stats.div_efd||0)+(stats.div_a100||0)+(stats.div_f100||0))>0?'warning':'' },
+    { label:'Não localizadas', value: stats.no_match || 0, sub: pct(stats.no_match, totalLinhas),
+      cls: (stats.no_match||0)>0?'danger':'' },
+    { label:'Pendências (CNPJs)', value: stats.pendencias || 0,
+      sub: stats.pendencias ? `R$ ${formatBR(stats.pendencias_total)} a auditar` : 'nenhuma',
+      cls: (stats.pendencias||0)>0?'warning':'success' },
+    { label:'NFs ambíguas', value: stats.amb_unresolved || 0, cls: (stats.amb_unresolved||0)>0?'danger':'' },
+    { label:'CNAEs buscados', value: stats.cnaes_buscados || 0 },
+  ];
+  const html = items.map(s => `
+    <div class="stat ${s.cls||''}">
+      <div class="label">${s.label}</div>
+      <div class="value">${typeof s.value==='number' ? s.value.toLocaleString('pt-BR') : s.value}</div>
+      ${s.sub ? `<div class="sub">${s.sub}</div>` : ''}
+    </div>
+  `).join('');
+  $('#stats').innerHTML = html;
+  $('#log').innerHTML = `<span class="ok">✓ Processamento concluído no servidor.</span>\n` +
+    `<span class="info">Arquivo gerado: ${window.__resultName}</span>\n` +
+    `<span class="info">Clique em "Baixar planilha cruzada" para fazer o download.</span>`;
+}
+
+// --------------- download ---------------
+function downloadResult(){
+  if (!window.__resultBlob) return;
+  const url = URL.createObjectURL(window.__resultBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = window.__resultName || 'razao-cruzado.xlsx';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 400);
+}
+
+// --------------- reset ---------------
+function resetAll(){
+  Object.keys(FILES).forEach(k => FILES[k] = null);
+  $$('.upload-card').forEach(c => {
+    c.classList.remove('loaded');
+    c.querySelector('.filename').innerHTML = '<span class="placeholder">Clique ou arraste o arquivo .xlsx</span>';
+    c.querySelector('.filesize').textContent = '';
+    c.querySelector('input[type=file]').value = '';
+  });
+  $('#results').hidden = true;
+  window.__resultBlob = null;
+  refreshState();
+}
+
+// --------------- init ---------------
+document.addEventListener('DOMContentLoaded', () => {
+  $$('.upload-card').forEach(attachUpload);
+  $('#btnProcess').addEventListener('click', processAll);
+  $('#btnDownload').addEventListener('click', downloadResult);
+  $('#btnReset').addEventListener('click', resetAll);
+});
+</script>
+
+</body>
+</html>

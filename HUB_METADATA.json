@@ -1,0 +1,52 @@
+{
+  "slug": "conferencia-razao-sped",
+  "nome": "Conferência Razão × SPED",
+  "descricao_curta": "Cruzamento triple-check entre Razão Contábil e blocos SPED (C100-EFD, A100, F100) com enriquecimento de CNPJ/CNAE e filtro CST 50–67.",
+  "area_responsavel": "Fiscal",
+
+  "tipo_acesso": "Interno",
+  "icone_emoji": "🔍",
+
+  "url_producao": "PREENCHER_APOS_DEPLOY",
+  "plataforma": "Render",
+
+  "abertura": {
+    "modo": "externa",
+    "target": "_blank"
+  },
+
+  "ícone_cores_sugeridas": {
+    "background_gradient_from": "#F2F5D8",
+    "background_gradient_to": "#B3BC2B",
+    "cor_texto": "#0C2B38"
+  },
+
+  "permissao": {
+    "chave": "conferencia-razao-sped",
+    "default_para_novos_usuarios": true,
+    "default_para_admin": true,
+    "default_para_equipe": true
+  },
+
+  "autenticacao_propria": {
+    "tem_login_proprio": false,
+    "credenciais_teste": null
+  },
+
+  "entrega": {
+    "desenvolvido_por": "PREENCHER",
+    "data_entrega": "2026-05-13",
+    "stack_utilizada": "Flask + Python 3.11 + pandas + openpyxl + BrasilAPI/CNPJa (Docker em Render)",
+    "repositorio_codigo": "PREENCHER_SE_HOUVER",
+    "observacoes": "Opção B do manual EFCT — processamento server-side para suportar arquivos SPED grandes (10-100 MB) sem limite de memória do navegador. Dados trafegam via HTTPS para servidor Flask próprio (Render). Consultas CNPJ→CNAE via BrasilAPI com cache em memória."
+  },
+
+  "validacoes": {
+    "url_acessivel_publicamente": false,
+    "padrao_visual_efct_seguido": true,
+    "header_hub_efct_presente": true,
+    "testado_em_producao": false,
+    "sem_credenciais_hardcoded": true,
+    "readme_preenchido": true
+  }
+}

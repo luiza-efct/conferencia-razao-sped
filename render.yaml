@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: conferencia-razao-sped
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
