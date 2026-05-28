@@ -35,7 +35,7 @@ A planilha gerada tem 2 abas:
 
 ## Regras de cruzamento
 
-- **Chave de match para C100-EFD e A100**: NF Extraída + CNPJ + Período (mensal)
+- **Chave de match para C100-EFD e A100**: NF Extraída + CNPJ — quando há múltiplos itens da mesma NF, **soma todos os itens** e compara o total com a Vlr Partida. Diferença &gt; R$ 100 é sinalizada como divergência na coluna Análise.
 - **Chave de match para F100**: CNPJ + Período + Vlr Operação ≈ Vlr Partida (F100 não tem NF — é design do SPED para operações sem nota)
 - **Filtro CST 50–67** aplicado em A100 (col 42 `CST Cofins`) e F100 (col 23 `CST Cofins`) — só lançamentos com direito a crédito entram na soma
 - **Tolerância R$ 100,00** para considerar "valor batido"

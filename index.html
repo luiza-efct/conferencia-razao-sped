@@ -374,19 +374,73 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
   <p>Faça upload da <strong>Razão Contábil</strong> e dos três blocos SPED. A ferramenta extrai NF e Razão Social do histórico, enriquece <strong>CNPJ + CNAEs</strong> via BrasilAPI, aplica filtro <strong>CST 50–67</strong> nos blocos de contribuições, gera coluna de <strong>análise de divergências</strong> e cria uma <strong>aba consolidada de Pendências por CNPJ</strong>.</p>
 
   <details class="howto">
-    <summary>Fluxo do Triple Check + CNAE + CST</summary>
+    <summary>Regras de cálculo (completas)</summary>
     <ol>
-      <li><strong>Pré-processamento:</strong> extrai NF e Razão Social do "Complemento Histórico" (padrão <code>VlrrefNF{n}VlrrefNF{n}NOME</code>). Em caso de ambiguidade, tenta resolver pela coluna NF original; se não conseguir, pede sua confirmação.</li>
-      <li><strong>Enriquecimento:</strong> identifica CNPJ via mapa Nome↔CNPJ derivado dos SPEDs, e busca <strong>1º e 2º CNAEs</strong> via BrasilAPI (com cache local e fallback CNPJa).</li>
-      <li><strong>Filtro CST 50–67:</strong> em A100 e F100, somente lançamentos com <code>CST Cofins</code> entre 50 e 67 (faixas "Direito a Crédito" e "Crédito Presumido") entram na soma. C100-EFD não recebe esse filtro.</li>
-      <li><strong>Triple Check:</strong>
+      <li><strong>🛡 Validação de empresa-raiz (antes de tudo):</strong> a ferramenta lê a coluna 1 (CNPJ da empresa que reporta) dos 4 arquivos. Se algum divergir dos demais, aborta com mensagem clara identificando qual arquivo está fora — evita processar acidentalmente um SPED de outra empresa.</li>
+
+      <li><strong>Pré-processamento da Razão — extração multi-padrão:</strong>
         <ul style="margin-left:18px;color:var(--muted)">
-          <li>C100-EFD / A100 → NF + CNPJ + Período</li>
-          <li>F100 → CNPJ + Período + Vlr Operação ≈ Vlr Partida</li>
+          <li>Extrai o <strong>Número da NF</strong> do "Complemento Histórico" testando 6 padrões em ordem de confiança: <code>VlrrefNF</code> → <code>NF / Nota Fiscal</code> → <code>N° / N.</code> → <code>Doc / Documento</code> → <code>Fatura / Duplicata</code> → <code>Boleto</code>. Aceita vários separadores (espaço, ponto, traço, barra, hashtag, dois-pontos).</li>
+          <li>Filtra candidatos plausíveis (2 a 10 dígitos — descarta automaticamente CPF/CNPJ/CEP que viriam por engano).</li>
+          <li><strong>Fallback automático pra col 15 (NF original):</strong> se o histórico não der pista, usa o valor da col 15 (status <code>FROM_COL15</code>). Reduz drasticamente os <code>⚠ NÃO IDENTIFICADO</code>.</li>
+          <li>Em caso de múltiplas NFs no mesmo histórico, tenta resolver pela col 15; senão marca como <code>⚠ AMBÍGUO</code>.</li>
+          <li>Extrai a <strong>Razão Social</strong> do mesmo Complemento removendo tokens fiscais, CNPJ/CPF, datas e palavras de ação contábil (Pagto, Refer, etc.).</li>
+          <li>Acumula a <strong>soma de Vlr Partida por NF+CNPJ</strong> — usado depois pra detectar quando uma NF está dividida em várias partidas contábeis.</li>
         </ul>
       </li>
-      <li><strong>Análise do Cruzamento:</strong> calcula <code>Vlr Partida − Σ blocos</code> e descreve em qual bloco a NF foi localizada (verde = sem divergência, âmbar = diverge, vermelho = não localizada).</li>
-      <li><strong>Aba "PENDÊNCIAS DE CRUZAMENTO":</strong> consolidação automática por CNPJ de todas as linhas não localizadas — ordenada do maior valor para o menor, com CNAEs e quantidade de lançamentos. Foco da auditoria em uma única visão.</li>
+
+      <li><strong>Enriquecimento de CNPJ — cascata de 4 estratégias:</strong>
+        <ul style="margin-left:18px;color:var(--muted)">
+          <li>Constrói mapa <code>Nome → CNPJ</code> a partir dos SPEDs (Nome Participante + CNPJ Participante das 3 bases).</li>
+          <li><strong>1ª tentativa</strong>: CNPJ aparece <em>direto no histórico</em> (formatado <code>99.999.999/9999-99</code> ou 14 dígitos seguidos) → usa direto (mais confiável).</li>
+          <li><strong>2ª tentativa</strong>: lookup do CNPJ pelo nome extraído — match exato → strip de CPF/CNPJ no fim → match por prefixo (mín 10 chars).</li>
+          <li><strong>3ª tentativa (reverse lookup)</strong>: varre o histórico inteiro procurando por nomes de fornecedores conhecidos (mapa SPED) como substring.</li>
+          <li><strong>4ª tentativa (NF-only fallback)</strong>: se ainda não achou o CNPJ mas a NF foi identificada, busca essa NF dentro dos próprios blocos SPED (C100-EFD, A100). Se há um único CNPJ com essa NF → usa direto. Se há múltiplos → desempata pelo Vlr Partida (mais próximo dentro da tolerância).</li>
+          <li>Busca <strong>Razão Social oficial + 1º e 2º CNAEs</strong> via <strong>BrasilAPI</strong> (fallback <strong>CNPJa</strong>). Cache em memória.</li>
+        </ul>
+      </li>
+
+      <li><strong>Filtro CST 50–67 (faixas "Direito a Crédito" + "Crédito Presumido"):</strong>
+        <ul style="margin-left:18px;color:var(--muted)">
+          <li><strong>C100-EFD FISCAL</strong>: NÃO aplica filtro CST (é ICMS/IPI — não tem CST PIS/COFINS relevante).</li>
+          <li><strong>A100-CONTRI</strong>: separa em 2 aggregates internos — <em>com crédito</em> (CST 50–67) e <em>sem crédito</em> (demais CSTs).</li>
+          <li><strong>F100-CONTRI</strong>: mesma divisão em 2 aggregates (com / sem crédito).</li>
+        </ul>
+      </li>
+
+      <li><strong>Agregação dos SPEDs:</strong>
+        <ul style="margin-left:18px;color:var(--muted)">
+          <li><strong>C100-EFD / A100</strong>: agrupa por <code>NF + CNPJ</code> (sem período — datas podem divergir entre blocos). Soma todos os itens da NF.</li>
+          <li><strong>F100</strong>: agrupa por <code>CNPJ + Período</code> (não tem coluna NF). Mantém lista de operações com Vlr Operação + Vlr BC Cofins.</li>
+        </ul>
+      </li>
+
+      <li><strong>Hierarquia de matches (ordem de prioridade):</strong>
+        <ol type="a" style="margin-left:18px;color:var(--muted)">
+          <li><strong>Match individual COM crédito:</strong> Σ itens SPED ≈ Vlr Partida (tolerância <strong>R$ 100</strong>) → célula <span style="color:#166534">verde</span>, Análise: <em>"Encontrado em [bloco]"</em>.</li>
+          <li><strong>Match por SOMA de partidas:</strong> a NF está dividida em várias partidas na Razão e Σ TODAS as partidas dessa NF ≈ Σ itens SPED → célula verde + coluna <strong>"Fecha somando partidas"</strong> preenchida com <em>"Fecha somando as N partidas (R$ X.XXX,XX)"</em>.</li>
+          <li><strong>Match com DIVERGÊNCIA (com crédito):</strong> NF localizada com crédito mas o valor não bate → célula <span style="color:#92400E">âmbar</span> + coluna <strong>"Valor da diferença"</strong> preenchida (número com sinal) + Análise: <em>"Encontrado em [bloco] com diferença"</em>.</li>
+          <li><strong>Match SEM crédito:</strong> NF não está nos aggregates com crédito, mas está nos aggregates sem crédito (A100 ou F100 com CST fora de 50–67) → célula em <em>italic navy</em> + Análise <em>"Encontrado em [bloco] sem crédito"</em>. <strong>NÃO vai pra Pendências</strong> — a NF existe no SPED, só não gera crédito PIS/COFINS.</li>
+          <li><strong>Match informativo C100-EFD (NF localizada, CNPJ não confirmado):</strong> o cruzamento estrito NF + CNPJ falhou MAS a NF existe no C100-EFD para algum CNPJ → célula em <em>italic</em> + Análise <em>"Encontrado em C100-EFD (NF localizada, CNPJ não confirmado)"</em>. <strong>NÃO vai pra Pendências</strong> — evita que essa NF seja contada como benefício em uma análise paralela (duplicidade).</li>
+          <li><strong>Não localizada em nenhum aggregate:</strong> Análise <span style="color:#991B1B">vermelha</span> <em>"Não localizado nos blocos de crédito"</em> + linha entra na aba <strong>PENDÊNCIAS DE CRUZAMENTO</strong>.</li>
+        </ol>
+      </li>
+
+      <li><strong>Layout das 11 colunas adicionadas (16 → 26):</strong>
+        <ul style="margin-left:18px;color:var(--muted)">
+          <li><strong>16-20</strong>: Número da Nota · Razão Social · CNPJ · 1º CNAE · 2º CNAE</li>
+          <li><strong>21-23</strong>: C100-EFD FISCAL · A100-CONTRI · F100-CONTRI (valores)</li>
+          <li><strong>24</strong>: Fecha somando partidas — preenchida só no caso 6.b</li>
+          <li><strong>25</strong>: Valor da diferença — preenchida só no caso 6.c (positivo = SPED a menor que Razão; negativo = SPED a maior)</li>
+          <li><strong>26</strong>: ANÁLISE DO CRUZAMENTO — status enxuto pra filtros do Excel</li>
+        </ul>
+      </li>
+
+      <li><strong>Aba "PENDÊNCIAS DE CRUZAMENTO":</strong> consolidação automática por CNPJ das linhas verdadeiramente não localizadas (caso 6.e). Ordenada DESC pelo valor total, com Razão Social oficial, CNAEs e qtd de lançamentos. Linhas "sem crédito" (caso 6.d) NÃO entram aqui.</li>
+
+      <li><strong>Tolerância: R$ 100,00</strong> — aplicada em todas as comparações de valor (individual, soma de partidas, F100 Vlr Operação). Editável no <code>logica.py</code> (constante <code>TOLERANCIA_VALOR</code>).</li>
+
+      <li><strong>Padrão visual EFCT na planilha gerada:</strong> fonte Exo 2, sem gridlines, cabeçalho navy <code>#0C2B38</code> + lime <code>#B3BC2B</code>, células de dados em fundo branco, divergências em cor do texto (não no fundo).</li>
     </ol>
   </details>
 </section>
@@ -417,9 +471,9 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
   </label>
 
   <label class="upload-card" data-key="a100">
-    <span class="role">Bloco 2 · CST 50–67</span>
+    <span class="role">Bloco 2 · CST 50–67 · OPCIONAL</span>
     <div class="title">A100 — CONTRI</div>
-    <div class="desc">EFD-Contribuições serviços. Σ BC Cofins apenas dos lançamentos com CST 50–67.</div>
+    <div class="desc">EFD-Contribuições serviços. Σ BC Cofins apenas dos lançamentos com CST 50–67. <em>Opcional — pule se a empresa não tem.</em></div>
     <div class="filename"><span class="placeholder">Clique ou arraste o arquivo .xlsx</span></div>
     <div class="filesize"></div>
     <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
@@ -427,9 +481,9 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
   </label>
 
   <label class="upload-card" data-key="f100">
-    <span class="role">Bloco 3 · CST 50–67</span>
+    <span class="role">Bloco 3 · CST 50–67 · OPCIONAL</span>
     <div class="title">F100 — CONTRI</div>
-    <div class="desc">Demais operações (frete, depreciação, financeiros). Σ BC Cofins apenas dos lançamentos com CST 50–67.</div>
+    <div class="desc">Demais operações (frete, depreciação, financeiros). Σ BC Cofins apenas dos lançamentos com CST 50–67. <em>Opcional — pule se a empresa não tem.</em></div>
     <div class="filename"><span class="placeholder">Clique ou arraste o arquivo .xlsx</span></div>
     <div class="filesize"></div>
     <input type="file" accept=".xlsx,.xls,.xlsm,.csv">
@@ -443,7 +497,7 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
   <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer">
     <input type="checkbox" id="chkSkipCNAE"> Pular busca de CNAE (mais rápido)
   </label>
-  <span class="status-bar" id="statusBar">Selecione os 4 arquivos para liberar o botão.</span>
+  <span class="status-bar" id="statusBar">Selecione Razão Contábil + C100-EFD FISCAL (obrigatórios) para liberar o botão. A100 e F100 são opcionais.</span>
 </div>
 
 <section class="results" id="results" hidden>
@@ -541,15 +595,22 @@ function handleFile(key, file, card){
 }
 
 function refreshState(){
-  const ready = FILES.razao && FILES.c100efd && FILES.a100 && FILES.f100;
+  // Razão e C100-EFD são OBRIGATÓRIOS. A100 e F100 são opcionais.
+  const ready = FILES.razao && FILES.c100efd;
   $('#btnProcess').disabled = !ready;
   const status = $('#statusBar');
+  const loaded = Object.values(FILES).filter(Boolean).length;
   if (ready){
-    status.textContent = 'Pronto para processar.';
+    const opc = (FILES.a100 ? 1 : 0) + (FILES.f100 ? 1 : 0);
+    status.textContent = opc === 2
+      ? 'Pronto para processar (todos os 4 arquivos carregados).'
+      : `Pronto para processar (2 obrigatórios + ${opc} opcionais).`;
     status.className = 'status-bar ok';
   } else {
-    const loaded = Object.values(FILES).filter(Boolean).length;
-    status.textContent = `${loaded} de 4 arquivos carregados.`;
+    const faltam = [];
+    if (!FILES.razao) faltam.push('Razão Contábil');
+    if (!FILES.c100efd) faltam.push('C100-EFD FISCAL');
+    status.textContent = `Faltam os arquivos obrigatórios: ${faltam.join(', ')}.`;
     status.className = 'status-bar';
   }
 }
@@ -598,8 +659,9 @@ async function processAll(){
     const fd = new FormData();
     fd.append('razao', FILES.razao);
     fd.append('c100efd', FILES.c100efd);
-    fd.append('a100', FILES.a100);
-    fd.append('f100', FILES.f100);
+    // A100 e F100 são opcionais — só envia se preenchido
+    if (FILES.a100) fd.append('a100', FILES.a100);
+    if (FILES.f100) fd.append('f100', FILES.f100);
     fd.append('skip_cnae', skipCNAE ? 'true' : 'false');
 
     const resp = await fetch('/api/processar', { method: 'POST', body: fd });

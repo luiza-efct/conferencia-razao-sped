@@ -39,16 +39,25 @@ def processar():
     Recebe 4 arquivos (razao, c100efd, a100, f100) via multipart/form-data
     e devolve o xlsx cruzado com as 2 abas (RAZÃO CONTABIL + PENDÊNCIAS DE CRUZAMENTO).
     """
+    def _real(fs):
+        """Returns FileStorage só se um arquivo real foi enviado (filename não vazio)."""
+        if fs is None or not getattr(fs, 'filename', None) or not fs.filename.strip():
+            return None
+        return fs
+
     try:
-        razao = request.files.get('razao')
-        c100efd = request.files.get('c100efd')
-        a100 = request.files.get('a100')
-        f100 = request.files.get('f100')
+        razao = _real(request.files.get('razao'))
+        c100efd = _real(request.files.get('c100efd'))
+        a100 = _real(request.files.get('a100'))  # opcional
+        f100 = _real(request.files.get('f100'))  # opcional
         skip_cnae = request.form.get('skip_cnae', 'false').lower() in ('true', '1', 'on')
 
-        if not all([razao, c100efd, a100, f100]):
+        # Apenas razao + c100efd são obrigatórios. A100/F100 são opcionais —
+        # empresas que não escrituram esses blocos podem processar mesmo assim.
+        if not razao or not c100efd:
             return jsonify({
-                'erro': 'Os 4 arquivos são obrigatórios: razao, c100efd, a100, f100',
+                'erro': 'Os arquivos Razão Contábil e C100-EFD FISCAL são obrigatórios. '
+                        'A100-CONTRI e F100-CONTRI são opcionais.',
                 'recebidos': {
                     'razao': bool(razao), 'c100efd': bool(c100efd),
                     'a100': bool(a100), 'f100': bool(f100)
@@ -57,14 +66,17 @@ def processar():
 
         app.logger.info(
             'Iniciando cruzamento: razao=%s c100efd=%s a100=%s f100=%s skip_cnae=%s',
-            razao.filename, c100efd.filename, a100.filename, f100.filename, skip_cnae
+            razao.filename, c100efd.filename,
+            a100.filename if a100 else '(não enviado)',
+            f100.filename if f100 else '(não enviado)',
+            skip_cnae,
         )
 
         out_bytes, stats = processar_cruzamento(
             razao_stream=razao.stream,
             c100efd_stream=c100efd.stream,
-            a100_stream=a100.stream,
-            f100_stream=f100.stream,
+            a100_stream=a100.stream if a100 else None,
+            f100_stream=f100.stream if f100 else None,
             skip_cnae=skip_cnae,
         )
 
