@@ -378,6 +378,8 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
     <ol>
       <li><strong>🛡 Validação de empresa-raiz (antes de tudo):</strong> a ferramenta lê a coluna 1 (CNPJ da empresa que reporta) dos 4 arquivos. Se algum divergir dos demais, aborta com mensagem clara identificando qual arquivo está fora — evita processar acidentalmente um SPED de outra empresa.</li>
 
+      <li><strong>🧹 Filtro Tipo de Lançamento:</strong> se a Razão tiver coluna "Tipo de Lançamento" (ou variação), linhas com <em>Encerramento</em> são descartadas antes do processamento. Apenas lançamentos normais entram na auditoria (encerramento é entrada técnica de fim de exercício, não transação real com NF).</li>
+
       <li><strong>Pré-processamento da Razão — extração multi-padrão:</strong>
         <ul style="margin-left:18px;color:var(--muted)">
           <li>Extrai o <strong>Número da NF</strong> do "Complemento Histórico" testando 6 padrões em ordem de confiança: <code>VlrrefNF</code> → <code>NF / Nota Fiscal</code> → <code>N° / N.</code> → <code>Doc / Documento</code> → <code>Fatura / Duplicata</code> → <code>Boleto</code>. Aceita vários separadores (espaço, ponto, traço, barra, hashtag, dois-pontos).</li>
@@ -426,13 +428,17 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
         </ol>
       </li>
 
-      <li><strong>Layout das 11 colunas adicionadas (16 → 26):</strong>
+      <li><strong>Layout das 12 colunas adicionadas (16 → 27):</strong>
         <ul style="margin-left:18px;color:var(--muted)">
-          <li><strong>16-20</strong>: Número da Nota · Razão Social · CNPJ · 1º CNAE · 2º CNAE</li>
-          <li><strong>21-23</strong>: C100-EFD FISCAL · A100-CONTRI · F100-CONTRI (valores)</li>
-          <li><strong>24</strong>: Fecha somando partidas — preenchida só no caso 6.b</li>
-          <li><strong>25</strong>: Valor da diferença — preenchida só no caso 6.c (positivo = SPED a menor que Razão; negativo = SPED a maior)</li>
-          <li><strong>26</strong>: ANÁLISE DO CRUZAMENTO — status enxuto pra filtros do Excel</li>
+          <li><strong>16</strong>: Número da Nota (extraído do histórico)</li>
+          <li><strong>17</strong>: Razão Social Extraída (do Complemento Histórico via tokenização)</li>
+          <li><strong>18</strong>: CNPJ (identificado via cascata de 4 camadas)</li>
+          <li><strong>19</strong>: Razão Social Oficial (da BrasilAPI/CNPJa — consulta do CNPJ)</li>
+          <li><strong>20-21</strong>: 1º CNAE · 2º CNAE (descrições completas)</li>
+          <li><strong>22-24</strong>: C100-EFD FISCAL · A100-CONTRI · F100-CONTRI (valores)</li>
+          <li><strong>25</strong>: Fecha somando partidas — preenchida só no caso 6.b</li>
+          <li><strong>26</strong>: Valor da diferença — preenchida só no caso 6.c (positivo = SPED a menor que Razão; negativo = SPED a maior)</li>
+          <li><strong>27</strong>: ANÁLISE DO CRUZAMENTO — status enxuto pra filtros do Excel</li>
         </ul>
       </li>
 
@@ -494,9 +500,6 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
 <div class="actions">
   <button id="btnProcess" class="primary" disabled>Processar cruzamento</button>
   <button id="btnReset" class="secondary" type="button">Limpar tudo</button>
-  <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer">
-    <input type="checkbox" id="chkSkipCNAE"> Pular busca de CNAE (mais rápido)
-  </label>
   <span class="status-bar" id="statusBar">Selecione Razão Contábil + C100-EFD FISCAL (obrigatórios) para liberar o botão. A100 e F100 são opcionais.</span>
 </div>
 
@@ -631,7 +634,6 @@ function hideProgress(){ $('#progress').classList.remove('active'); }
 
 // --------------- core: chamada ao backend ---------------
 async function processAll(){
-  const skipCNAE = $('#chkSkipCNAE') ? $('#chkSkipCNAE').checked : false;
   showProgress('Enviando arquivos para o servidor…', 'Aguardando processamento (pode levar 10–60s)');
 
   // simula uma sub-mensagem que vai trocando enquanto o backend processa
@@ -662,7 +664,7 @@ async function processAll(){
     // A100 e F100 são opcionais — só envia se preenchido
     if (FILES.a100) fd.append('a100', FILES.a100);
     if (FILES.f100) fd.append('f100', FILES.f100);
-    fd.append('skip_cnae', skipCNAE ? 'true' : 'false');
+    // Consulta CNPJ→Razão Social/CNAE é sempre obrigatória — sem opção de pular
 
     const resp = await fetch('/api/processar', { method: 'POST', body: fd });
 

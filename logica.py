@@ -14,10 +14,10 @@ Port da implementação client-side JS para Python — mantém todos os comporta
 """
 import io
 import re
+import time
 import difflib
 import logging
 import unicodedata
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -26,7 +26,6 @@ import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.views import SheetView
 
 
 log = logging.getLogger(__name__)
@@ -35,7 +34,7 @@ log = logging.getLogger(__name__)
 # CONSTANTES
 # ============================================================
 TOLERANCIA_VALOR = 100.00
-CNAE_CONCURRENCY = 5
+CNAE_CONCURRENCY = 3  # paralelismo conservador pra não bater rate limit
 CNAE_TIMEOUT = 12  # segundos por request HTTP
 USER_AGENT = 'Mozilla/5.0 EFCT-Hub/1.0'
 
@@ -171,6 +170,56 @@ def normalize_name(s) -> str:
     return re.sub(r'[^A-Z0-9]', '', no_accent.upper())
 
 
+# Sufixos societários e palavras genéricas que NÃO ajudam a identificar a empresa.
+# São ignorados ao comparar nomes (senão "FULANO LTDA" e "BELTRANO LTDA" pareceriam
+# similares só por causa do "LTDA").
+_NAME_STOPWORDS = {
+    'LTDA', 'ME', 'EPP', 'EIRELI', 'SA', 'S', 'A', 'EI', 'MEI', 'CIA',
+    'E', 'DE', 'DA', 'DO', 'DOS', 'DAS', 'EM', 'COMERCIAL', 'COMERCIO',
+    'INDUSTRIA', 'SERVICOS', 'SERVICO', 'LTD',
+}
+
+
+def _name_tokens(s) -> set:
+    """Tokens significativos de um nome (sem acento, uppercase, sem stopwords)."""
+    norm = _normalize_for_keyword(str(s)) if s else ''
+    toks = re.findall(r'[A-Z0-9]+', norm)
+    return {t for t in toks if t not in _NAME_STOPWORDS and len(t) > 1}
+
+
+def _names_reconcile(a, b) -> float:
+    """Mede o quanto dois nomes de empresa 'fecham' (0.0 a 1.0).
+
+    Combina 3 sinais e pega o maior:
+      • igualdade exata após normalização → 1.0
+      • um nome contido no outro (substring longa) → 0.92
+      • Jaccard dos tokens significativos (ignora LTDA/ME/etc)
+      • similaridade Levenshtein da string compactada
+
+    Usado pra GARANTIR que o CNPJ/razão social trazido fecha com o que está no
+    Complemento Histórico — se não fechar, o CNPJ é descartado.
+    """
+    na, nb = normalize_name(a), normalize_name(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    if len(na) >= 6 and (na in nb or nb in na):
+        return 0.92
+    ta, tb = _name_tokens(a), _name_tokens(b)
+    jac = len(ta & tb) / len(ta | tb) if (ta and tb) else 0.0
+    seq = difflib.SequenceMatcher(None, na, nb).ratio()
+    return max(jac, seq)
+
+
+# Limiar mínimo de reconciliação pra aceitar um CNPJ de fonte "fraca"
+# (fuzzy/prefixo/web). Abaixo disso, o CNPJ é descartado (fica em branco).
+RECONCILE_THRESHOLD = 0.60
+# Fontes confiáveis por construção (o nome/CNPJ já está literalmente no histórico
+# ou bate exatamente com o mapa SPED) — dispensam o portão de validação.
+_TRUSTED_VIAS = {'DIRETO_HISTORICO', 'HISTORICO_SCAN', 'EXACT', 'EXACT_STRIPPED', 'STRIP_DIGITS'}
+
+
 def normalize_cnpj(c) -> str:
     if c is None or (isinstance(c, float) and pd.isna(c)):
         return ''
@@ -303,55 +352,228 @@ def _looks_like_nf_number(digits: str) -> bool:
     return bool(digits) and digits.isdigit() and 2 <= len(digits) <= 10
 
 
-def extract_nf_from_historico(complemento, col15_raw=None) -> dict:
-    """Extrai NF do Complemento Histórico testando múltiplos padrões em ordem de confiança.
+# Palavras de contexto fiscal que NUNCA fazem parte do nome do fornecedor.
+# Comparadas após uppercase + remoção de acentos.
+FISCAL_KEYWORDS = {
+    'VLR', 'VALOR', 'PGTO', 'PAGTO', 'PAGAMENTO', 'PGMTO', 'PAGO',
+    'REF', 'REFER', 'REFERENTE', 'REFERENCIA', 'REFNF',
+    'NF', 'NFE', 'NOTA', 'FISCAL',
+    'NFSE', 'NFS', 'NFSES', 'NFCE', 'NFC', 'DANFE', 'RPS', 'CTE', 'CT',  # tipos de documento fiscal
+    'NO', 'NUM', 'NUMERO', 'NR', 'NRO', 'NUMERACAO', 'SERIE',  # abreviações de "Número" (No, Num, Nº já cobertos pelo upper_norm)
+    'DOC', 'DOCUMENTO', 'DOCTO',
+    'FATURA', 'DUPLICATA', 'DUPL',
+    'BOLETO', 'BOL',
+    'COMPRA', 'AQUISICAO', 'DEVOLUCAO', 'PRESTACAO',
+    'VLRREF', 'VLRREFNF',
+    'TOTAL', 'PARCELA', 'PARC',
+    'CONFORME', 'CONF',
+    'DESPESA', 'LANCAMENTO',
+    'LR',  # "Lançamento Razão" — prefixo comum
+    'APROP', 'APROPRIACAO',  # "Apropriação"
+    'ORIGINAL', 'OMISSO', 'OMISSA',  # marcadores de status do lançamento
+    'MENSALIDADE', 'MENSAL', 'AREA',  # descrições recorrentes (não fazem parte do nome)
+    'RS',  # "R$" sem o cifrão (ex: "RS 1.200,00")
+}
+# Nota: 'SERVICO'/'SERVICOS' NÃO entram aqui — aparecem muito em razões sociais
+# ("CLINISEG SERVICOS DE APOIO"). O prefixo "PRESTACAO DE SERVICOS" é tratado
+# via stripping de conectores nas pontas do nome (ver smart_extract).
 
-    Estratégia:
-      1. Tenta cada padrão (VlrrefNF → NF → N. → Doc → Fatura → Boleto)
-      2. Coleta TODOS os candidatos plausíveis (2–10 dígitos, descartando CPF/CNPJ)
-      3. Se há col 15 (NF original da Razão) e bate com um candidato → usa esse
-      4. Se houver só 1 candidato distinto → CONFIDENT
-      5. Se houver múltiplos sem resolução → AMBIGUOUS
-      6. Se nenhum candidato no histórico mas col 15 tem valor → FROM_COL15 (fallback)
-      7. Caso contrário → NOT_FOUND
+# Letras isoladas que costumam ser marcadores ("N F 12345"), não nomes
+NF_MARKERS_SINGLE = {'N', 'F', 'NF', 'NFE'}
+
+# Preposições/conectores que NUNCA iniciam uma razão social. São removidos só
+# das PONTAS do nome extraído (no meio permanecem: "SERVICOS DE APOIO").
+NAME_EDGE_STOPWORDS = {'DE', 'DA', 'DO', 'DOS', 'DAS', 'E', 'EM', 'A', 'O'}
+
+
+def _normalize_for_keyword(s: str) -> str:
+    """Uppercase + remove acentos pra comparar com FISCAL_KEYWORDS."""
+    nfd = unicodedata.normalize('NFD', s.upper())
+    return ''.join(c for c in nfd if unicodedata.category(c) != 'Mn')
+
+
+def _preprocess_historico(s: str) -> str:
+    """Insere espaços entre letras-e-dígitos grudados.
+    Resolve casos como 'VlrrefNF40273DEMILSADAA' → 'VlrrefNF 40273 DEMILSADAA'."""
+    if not s:
+        return ''
+    s = str(s)
+    s = re.sub(r'([a-zA-ZÀ-ÿ])(\d)', r'\1 \2', s)
+    s = re.sub(r'(\d)([a-zA-ZÀ-ÿ])', r'\1 \2', s)
+    return s
+
+
+def tokenize_historico(historico: str) -> list:
+    """Tokeniza o histórico e classifica cada token semanticamente.
+
+    Tipos: CNPJ, CPF, DATE, NUMBER, KEYWORD, NF_MARKER, NAME.
+    Devolve lista de tuplas (kind, token_original, valor_processado).
+
+    Pós-processamento: NF_MARKER só permanece se for seguido (eventualmente)
+    por NUMBER. Caso contrário vira NAME (resolve 'F C SERVICOS' onde 'F' é
+    parte do nome, não marcador).
     """
-    s = str(complemento) if complemento and not (isinstance(complemento, float) and pd.isna(complemento)) else ''
-    candidates: list[str] = []
+    if not historico:
+        return []
+    preprocessed = _preprocess_historico(historico)
+    raw_tokens = re.findall(r'\S+', preprocessed)
+    out = []
+    for tok in raw_tokens:
+        bare = re.sub(r'^[^\w]+|[^\w]+$', '', tok)
+        if not bare:
+            continue
+        upper_norm = _normalize_for_keyword(bare)
+        # CNPJ formatado
+        if re.match(r'^\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}$', tok):
+            out.append(('CNPJ', tok, bare))
+        # CNPJ raw (14 dígitos)
+        elif bare.isdigit() and len(bare) == 14:
+            out.append(('CNPJ', tok, bare))
+        # CPF formatado
+        elif re.match(r'^\d{3}\.\d{3}\.\d{3}-\d{2}$', tok):
+            out.append(('CPF', tok, bare))
+        # CPF raw (11 dígitos)
+        elif bare.isdigit() and len(bare) == 11:
+            out.append(('CPF', tok, bare))
+        # Data DD/MM/YY[YY]
+        elif re.match(r'^\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}$', tok):
+            out.append(('DATE', tok, bare))
+        # Data curta DD/MM (sem ano) — só se ambos forem 1-31
+        elif (m := re.match(r'^(\d{1,2})/(\d{1,2})$', tok)) and 1 <= int(m.group(1)) <= 31 and 1 <= int(m.group(2)) <= 31:
+            out.append(('DATE', tok, bare))
+        # Valor monetário (X.XXX,XX ou X,XXX.XX) — dígitos com vírgula e/ou ponto
+        elif re.match(r'^\$?\d{1,3}([.,]\d{3})*[.,]\d{2}$', tok) or re.match(r'^\d+[.,]\d{2,3}$', tok):
+            out.append(('MONEY', tok, bare))
+        # Token "R$" sozinho ou junto com valor
+        elif upper_norm in ('R', 'RS', 'R$') and re.match(r'^R\$?\d*[.,]?\d*$', tok.upper()):
+            out.append(('MONEY', tok, bare))
+        # Número puro
+        elif bare.isdigit():
+            out.append(('NUMBER', tok, bare))
+        # Keyword fiscal
+        elif upper_norm in FISCAL_KEYWORDS:
+            out.append(('KEYWORD', tok, upper_norm))
+        # Letra(s) isolada(s) — provável marcador NF ("N F 12345")
+        elif upper_norm in NF_MARKERS_SINGLE:
+            out.append(('NF_MARKER', tok, upper_norm))
+        else:
+            out.append(('NAME', tok, bare))
 
-    if s:
-        for pat in NF_PATTERNS:
-            for m in pat.findall(s):
-                if isinstance(m, tuple):
-                    m = next((g for g in m if g), '')
-                if _looks_like_nf_number(m):
-                    try:
-                        candidates.append(str(int(m)))
-                    except (ValueError, OverflowError):
-                        pass
+    # Pós-processamento: NF_MARKER sem NUMBER subsequente vira NAME
+    # (resolve 'F C SERVICOS' onde 'F' é parte do nome, não marcador)
+    for i in range(len(out)):
+        if out[i][0] != 'NF_MARKER':
+            continue
+        is_real_marker = False
+        for j in range(i + 1, len(out)):
+            nk = out[j][0]
+            if nk == 'NF_MARKER':
+                continue  # outro marker em sequência, continua olhando
+            if nk == 'NUMBER':
+                nv = out[j][2]
+                if 3 <= len(nv) <= 10:
+                    is_real_marker = True
+            break  # para no primeiro token não-NF_MARKER
+        if not is_real_marker:
+            out[i] = ('NAME', out[i][1], out[i][2])
+    return out
 
-    unique = list(dict.fromkeys(candidates))
+
+def smart_extract(historico, col15_raw=None) -> dict:
+    """Extrai NF + nome do fornecedor por classificação semântica dos tokens.
+
+    Funciona em históricos sem padrão fixo — não precisa de regex específica
+    pra cada formato. Cada token é classificado e a NF é o primeiro NUMBER
+    "plausível" (3–10 dígitos), com bônus se vier após uma KEYWORD fiscal
+    ou NF_MARKER. Todos os tokens classificados como NAME formam a Razão Social.
+
+    Retorna: {'value', 'status', 'candidates', 'name'}.
+    """
+    classified = tokenize_historico(historico)
+    if not classified and not col15_raw:
+        return {'value': None, 'status': 'EMPTY', 'candidates': [], 'name': ''}
+
+    # Coleta candidatos a NF com score por contexto
+    nf_candidates = []  # (valor_str, score, posicao)
+    for i, (kind, _raw, val) in enumerate(classified):
+        if kind != 'NUMBER':
+            continue
+        n = len(val)
+        if n > 10:
+            continue  # >10 = CPF/CNPJ/conta
+        prev_is_marker = i > 0 and classified[i - 1][0] in ('NF_MARKER', 'KEYWORD')
+        # NF de 2 dígitos só é aceita se vier logo após marker fiscal
+        # (evita confundir com mês/dia em texto solto)
+        if n < 3 and not prev_is_marker:
+            continue
+        score = 1
+        if prev_is_marker:
+            score = 100
+        elif i == 0:
+            score = 50  # número no INÍCIO do histórico (caso "25443 ALLFOR...")
+        nf_candidates.append((str(int(val)), score, i))
+
+    nf_value = None
+    nf_status = 'NOT_FOUND'
+    candidates_list = []
+    if nf_candidates:
+        nf_candidates.sort(key=lambda x: (-x[1], x[2]))
+        nf_value = nf_candidates[0][0]
+        top_score = nf_candidates[0][1]
+        same_score_vals = list({c[0] for c in nf_candidates if c[1] == top_score})
+        candidates_list = list({c[0] for c in nf_candidates})
+        nf_status = 'CONFIDENT' if len(same_score_vals) == 1 else 'AMBIGUOUS'
+        if nf_status == 'AMBIGUOUS':
+            nf_value = None  # não escolhe automaticamente em caso de empate
+
+    # Fallback / desempate pela col 15
     c15 = normalize_nf(col15_raw)
+    if not nf_value and c15:
+        if not candidates_list:
+            nf_value = c15
+            nf_status = 'FROM_COL15'
+            candidates_list = [c15]
+        elif c15 in candidates_list:
+            nf_value = c15
+            nf_status = 'AMBIGUOUS_RESOLVED'
 
-    # Caso 1: nenhum candidato no histórico
-    if not unique:
-        if c15:
-            return {'value': c15, 'status': 'FROM_COL15', 'candidates': [c15]}
-        return {
-            'value': None,
-            'status': ('EMPTY' if not s else 'NOT_FOUND'),
-            'candidates': [],
-        }
+    # Razão Social = junção de TODOS os tokens NAME, com limpeza das pontas.
+    # Removemos conectores/preposições do INÍCIO e FIM (ex: "de CLINISEG ..."
+    # vira "CLINISEG ..."; "... LTDA de" vira "... LTDA"). No meio permanecem
+    # ("SERVICOS DE APOIO"). Isso dá uma razão social limpa, melhorando o match
+    # por nome no mapa SPED e a busca de CNPJ.
+    name_tokens = [val for kind, _raw, val in classified if kind == 'NAME']
+    name_tokens = _strip_edge_stopwords(name_tokens)
+    name = ' '.join(name_tokens).strip()
 
-    # Caso 2: um candidato único
-    if len(unique) == 1:
-        return {'value': unique[0], 'status': 'CONFIDENT', 'candidates': unique}
+    return {
+        'value': nf_value,
+        'status': nf_status,
+        'candidates': candidates_list,
+        'name': name,
+    }
 
-    # Caso 3: múltiplos — tenta resolver com col 15
-    if c15 and c15 in unique:
-        return {'value': c15, 'status': 'AMBIGUOUS_RESOLVED', 'candidates': unique}
 
-    # Caso 4: ambiguidade não resolvida
-    return {'value': None, 'status': 'AMBIGUOUS', 'candidates': unique}
+def _strip_edge_stopwords(tokens: list) -> list:
+    """Remove preposições/conectores das PONTAS da lista de tokens do nome.
+    No miolo eles permanecem (uma razão social pode conter 'DE', 'E', etc.)."""
+    toks = list(tokens)
+    while toks and _normalize_for_keyword(toks[0]) in NAME_EDGE_STOPWORDS:
+        toks.pop(0)
+    while toks and _normalize_for_keyword(toks[-1]) in NAME_EDGE_STOPWORDS:
+        toks.pop()
+    return toks
+
+
+def extract_nf_from_historico(complemento, col15_raw=None) -> dict:
+    """Extrai NF do Complemento Histórico via tokenização + classificação semântica.
+    Wrapper sobre smart_extract pra manter compatibilidade da API."""
+    r = smart_extract(complemento, col15_raw=col15_raw)
+    return {
+        'value': r['value'],
+        'status': r['status'],
+        'candidates': r['candidates'],
+    }
 
 
 def extract_cnpj_from_historico(complemento) -> str | None:
@@ -370,40 +592,13 @@ def extract_cnpj_from_historico(complemento) -> str | None:
 
 
 def extract_supplier_name(complemento) -> str:
-    """Limpa o Complemento Histórico tentando isolar a Razão Social.
+    """Extrai a Razão Social do Complemento Histórico via tokenização semântica.
 
-    Remove tokens conhecidos (VlrrefNF, NF/N F, Nota Fiscal, Doc, Fatura, Duplicata,
-    Boleto, número solto no início, CNPJ/CPF, datas, palavras de ação contábil) e
-    devolve o que sobra. Para o casamento real com o mapa SPED a função
-    `lookup_cnpj` faz fuzzy match (Levenshtein), então mesmo uma limpeza
-    imperfeita ainda permite achar o CNPJ.
+    Junta todos os tokens classificados como NAME (não-keywords, não-números,
+    não-CPF/CNPJ, não-datas). Funciona em qualquer formato de histórico
+    porque a classificação é por significado, não por regex de posição.
     """
-    if not complemento or (isinstance(complemento, float) and pd.isna(complemento)):
-        return ''
-    s = str(complemento)
-    # Tokens fiscais com número (mesmos padrões da extração de NF — aceita espaços entre N e F)
-    s = re.sub(r'\bVlr\s*ref\s*N[\.\s\-]*F[\.\s\-]*\d+', ' ', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bN(?:ota)?[\s\.\-]*F(?:iscal)?[\s\.\-/#:]*(?:e[\s\.\-/]*)?(?:n[ºo°]?\.?[\s]*)?\d{2,}', ' ', s, flags=re.IGNORECASE)
-    s = re.sub(r'\bDoc(?:umento)?(?:\s*fiscal)?[\s\.\-/#:]*(?:n[ºo°]?\.?\s*)?\d{2,}', ' ', s, flags=re.IGNORECASE)
-    s = re.sub(r'\b(?:Fatura|Duplicata|Dupl?|Bol(?:eto)?)[\s\.\-/#:]*(?:n[ºo°]?\.?\s*)?\d{2,}', ' ', s, flags=re.IGNORECASE)
-    # CNPJ e CPF (formatado e raw)
-    s = re.sub(r'\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b', ' ', s)
-    s = re.sub(r'\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b', ' ', s)
-    # Datas DD/MM/YY[YY] ou DD.MM.YY[YY] ou DD-MM-YY[YY]
-    s = re.sub(r'\b\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}\b', ' ', s)
-    # Número solto no INÍCIO (caso "25443 A GAZETA DO ESPIRITO SANTO RADIO E TV")
-    # Apenas se seguido de espaço + letra (não come datas/CPF que não casaram acima)
-    s = re.sub(r'^\s*\d{2,10}\s+(?=[A-Za-zÀ-ÿ])', ' ', s)
-    # Palavras de ação contábil
-    s = re.sub(
-        r'\b(?:Pagto|Pagamento|Refer[eê]nte|Refer|Ref|Pgto|Vlr|Valor|Total|Pago|Aquisi[cç][aã]o|Compra|Devolu[cç][aã]o|pgmto)\b',
-        ' ', s, flags=re.IGNORECASE,
-    )
-    # Restos de tokens "n.", "nº", "no" soltos
-    s = re.sub(r'\bn[ºo°][\.\s]*\d*', ' ', s, flags=re.IGNORECASE)
-    # Normaliza espaços múltiplos
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
+    return smart_extract(complemento)['name']
 
 
 def build_nf_only_index(agg_nf_map: dict) -> dict:
@@ -454,6 +649,172 @@ def lookup_cnpj_by_nf_in_speds(nf_value, vlr_partida, nf_idx_list) -> dict | Non
             return {'cnpj': best_cnpj, 'via': 'NF_SPED_VALOR'}
         # Ambíguo: vários CNPJs com essa NF e nenhum bate com Vlr Partida.
         # Não retorna nada — preferimos deixar sem CNPJ a inferir errado.
+    return None
+
+
+# Cache de busca web — chave: nome_normalizado → {cnpj, razao_social} ou None (falhou)
+NAME_CNPJ_WEB_CACHE: dict = {}
+WEB_SEARCH_THROTTLE = 3.0  # segundos entre buscas (educado com APIs anti-bot)
+WEB_SEARCH_USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+]
+# Contador de falhas consecutivas por fonte — quando atinge limite, pula a fonte
+_SOURCE_FAILURES: dict = {'bing': 0, 'ddg': 0, 'cnpjbiz': 0}
+_SOURCE_BLOCKED_THRESHOLD = 5  # se 5 buscas seguidas falharem → fonte bloqueada
+
+
+def _pick_user_agent() -> str:
+    import random
+    return random.choice(WEB_SEARCH_USER_AGENTS)
+
+
+def _extract_cnpjs_from_html(html: str) -> list[str]:
+    """Extrai todos os CNPJs (formatados ou raw 14 dígitos) de um HTML."""
+    found = []
+    seen = set()
+    for m in re.finditer(r'\b(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})\b', html):
+        c = normalize_cnpj(m.group(1))
+        if len(c) == 14 and c not in seen:
+            seen.add(c)
+            found.append(c)
+    return found
+
+
+def _search_bing(query: str) -> list[str]:
+    """Busca no Bing e devolve candidatos a CNPJ encontrados no HTML."""
+    headers = {
+        'User-Agent': _pick_user_agent(),
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml',
+    }
+    try:
+        r = requests.get(
+            'https://www.bing.com/search',
+            params={'q': query, 'cc': 'BR', 'setlang': 'pt-BR'},
+            headers=headers,
+            timeout=12,
+        )
+        if not r.ok:
+            return []
+        return _extract_cnpjs_from_html(r.text)
+    except Exception as e:
+        log.debug('Bing falhou: %s', e)
+        return []
+
+
+def _search_ddg(query: str) -> list[str]:
+    """Busca no DuckDuckGo HTML e devolve candidatos a CNPJ."""
+    headers = {
+        'User-Agent': _pick_user_agent(),
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml',
+    }
+    try:
+        r = requests.post(
+            'https://html.duckduckgo.com/html/',
+            data={'q': query},
+            headers=headers,
+            timeout=12,
+        )
+        if not r.ok:
+            return []
+        return _extract_cnpjs_from_html(r.text)
+    except Exception as e:
+        log.debug('DDG falhou: %s', e)
+        return []
+
+
+def _search_cnpjbiz(name: str) -> list[str]:
+    """Busca no cnpj.biz (site especializado em CNPJ) por nome."""
+    headers = {
+        'User-Agent': _pick_user_agent(),
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+    }
+    try:
+        r = requests.get(
+            'https://cnpj.biz/procura',
+            params={'q': name},
+            headers=headers,
+            timeout=12,
+        )
+        if not r.ok:
+            return []
+        return _extract_cnpjs_from_html(r.text)
+    except Exception as e:
+        log.debug('cnpj.biz falhou: %s', e)
+        return []
+
+
+def _try_source(src_key: str, search_fn, query: str) -> list[str]:
+    """Tenta uma fonte de busca. Se ela está marcada como bloqueada, pula."""
+    if _SOURCE_FAILURES.get(src_key, 0) >= _SOURCE_BLOCKED_THRESHOLD:
+        return []  # fonte já desistiu pra essa execução
+    candidates = search_fn(query)
+    if candidates:
+        _SOURCE_FAILURES[src_key] = 0  # sucesso reseta contador
+    else:
+        _SOURCE_FAILURES[src_key] = _SOURCE_FAILURES.get(src_key, 0) + 1
+        if _SOURCE_FAILURES[src_key] == _SOURCE_BLOCKED_THRESHOLD:
+            log.warning('Fonte web "%s" parece bloqueada (5 falhas seguidas) — pulando.', src_key)
+    return candidates
+
+
+def search_cnpj_by_name_web(supplier_name: str) -> dict | None:
+    """5ª camada: descobre o CNPJ pesquisando o nome do fornecedor na web.
+
+    Tenta 3 fontes em sequência (Bing → DuckDuckGo → cnpj.biz). Cada fonte é
+    descartada após 5 falhas consecutivas (provável bloqueio anti-bot).
+    Todos os candidatos coletados são validados via BrasilAPI/CNPJa: só aceita
+    o primeiro CNPJ cujo nome oficial é similar (Levenshtein ≥ 0.55) ao buscado.
+    """
+    if not supplier_name or len(supplier_name) < 8:
+        return None
+    key = normalize_name(supplier_name)
+    if not key:
+        return None
+    if key in NAME_CNPJ_WEB_CACHE:
+        return NAME_CNPJ_WEB_CACHE[key]
+
+    query = f'{supplier_name} CNPJ'
+    # Coleta candidatos de todas as fontes disponíveis
+    candidates: list[str] = []
+    for src_key, src_fn in (('bing', _search_bing),
+                            ('ddg', _search_ddg),
+                            ('cnpjbiz', lambda q: _search_cnpjbiz(supplier_name))):
+        cands = _try_source(src_key, src_fn, query)
+        for c in cands:
+            if c not in candidates:
+                candidates.append(c)
+        # Se já temos 5+ candidatos, não precisa consultar mais fontes
+        if len(candidates) >= 5:
+            break
+
+    if not candidates:
+        NAME_CNPJ_WEB_CACHE[key] = None
+        return None
+
+    # Valida candidatos via BrasilAPI/CNPJa — só aceita se o nome bater
+    for cnpj in candidates[:8]:
+        data = fetch_cnae_once(cnpj)
+        if not data or not data.get('razao_social'):
+            continue
+        # Reconcilia o nome OFICIAL (da Receita) com o nome buscado (do histórico).
+        # Limiar alto: a web traz muito candidato parecido-mas-errado.
+        sim = _names_reconcile(supplier_name, data['razao_social'])
+        if sim >= 0.70:
+            result = {
+                'cnpj': cnpj,
+                'via': 'WEB_SEARCH',
+                'matched_name': data['razao_social'],
+                'similarity': round(sim, 2),
+            }
+            NAME_CNPJ_WEB_CACHE[key] = result
+            log.info('Web search "%s" → %s (%s, sim=%.2f)',
+                     supplier_name[:50], cnpj, data['razao_social'][:40], sim)
+            return result
+    NAME_CNPJ_WEB_CACHE[key] = None
     return None
 
 
@@ -512,7 +873,7 @@ def lookup_cnpj(extracted_name: str, cnpj_map: dict) -> dict | None:
             if k == stripped:
                 return {'cnpj': v, 'via': 'EXACT_STRIPPED'}
             if (k.startswith(stripped) or stripped.startswith(k)) and min(len(k), len(stripped)) >= 10:
-                return {'cnpj': v, 'via': 'PREFIX'}
+                return {'cnpj': v, 'via': 'PREFIX', 'matched_name': k}
     # 4. Fuzzy match (Levenshtein) — cobre "EMPRESA LTDA" vs "EMPRESA LTDA ME", etc.
     # Só dispara pra nomes longos o suficiente pra evitar falso positivo
     needle = stripped if len(stripped) >= 10 else norm
@@ -526,77 +887,162 @@ def lookup_cnpj(extracted_name: str, cnpj_map: dict) -> dict | None:
 # ============================================================
 # CNAE LOOKUP — BrasilAPI primário + CNPJa fallback, com cache
 # ============================================================
-def fetch_cnae_once(cnpj: str) -> dict | None:
-    if cnpj in CNAE_CACHE:
-        return CNAE_CACHE[cnpj]
+def _is_valid_result(d: dict) -> bool:
+    """Considera resultado válido só quando tem razão social ou CNAE preenchido."""
+    return bool(d) and bool(d.get('razao_social') or d.get('cnae1_desc'))
+
+
+def _parse_brasilapi(d: dict) -> dict:
+    result = {
+        'razao_social': d.get('razao_social') or d.get('nome_fantasia') or '',
+        'cnae1_desc': d.get('cnae_fiscal_descricao') or '',
+        'cnae2_desc': '',
+        'source': 'BrasilAPI',
+    }
+    sec = d.get('cnaes_secundarios') or []
+    if sec and isinstance(sec, list) and sec[0]:
+        result['cnae2_desc'] = sec[0].get('descricao') or ''
+    return result
+
+
+def _parse_cnpja(d: dict) -> dict:
+    main = d.get('mainActivity') or {}
+    sides = d.get('sideActivities') or []
+    side = sides[0] if sides else {}
+    company = d.get('company') or {}
+    return {
+        'razao_social': company.get('name') or d.get('alias') or '',
+        'cnae1_desc': main.get('text') or '',
+        'cnae2_desc': side.get('text') or '',
+        'source': 'CNPJa',
+    }
+
+
+def _parse_receitaws(d: dict) -> dict | None:
+    if d.get('status') == 'ERROR':
+        return None
+    main = d.get('atividade_principal') or []
+    main_first = main[0] if main and isinstance(main, list) else {}
+    sec = d.get('atividades_secundarias') or []
+    sec_first = sec[0] if sec and isinstance(sec, list) else {}
+    return {
+        'razao_social': d.get('nome') or d.get('fantasia') or '',
+        'cnae1_desc': main_first.get('text') if isinstance(main_first, dict) else '',
+        'cnae2_desc': sec_first.get('text') if isinstance(sec_first, dict) else '',
+        'source': 'ReceitaWS',
+    }
+
+
+def _try_api(url: str, parse_fn, source_name: str, cnpj: str) -> dict | None:
+    """Tenta uma API com retry em HTTP 429 (rate limit). Devolve dict válido ou None."""
     headers = {'User-Agent': USER_AGENT}
-    # BrasilAPI primário
-    try:
-        r = requests.get(
-            f'https://brasilapi.com.br/api/cnpj/v1/{cnpj}',
-            headers=headers, timeout=CNAE_TIMEOUT
-        )
-        if r.ok:
-            d = r.json()
-            result = {
-                'razao_social': d.get('razao_social') or d.get('nome_fantasia') or '',
-                'cnae1_desc': d.get('cnae_fiscal_descricao') or '',
-                'cnae2_desc': '',
-                'source': 'BrasilAPI',
-            }
-            sec = d.get('cnaes_secundarios') or []
-            if sec and isinstance(sec, list) and sec[0]:
-                result['cnae2_desc'] = sec[0].get('descricao') or ''
-            CNAE_CACHE[cnpj] = result
-            return result
-    except Exception as e:
-        log.debug('BrasilAPI %s falhou: %s', cnpj, e)
-    # CNPJa fallback
-    try:
-        r = requests.get(
+    for attempt in range(2):  # 2 tentativas (original + 1 retry após 429)
+        try:
+            r = requests.get(url, headers=headers, timeout=CNAE_TIMEOUT)
+            if r.status_code == 429:
+                # Rate limit — espera antes de tentar de novo
+                wait = 2 + attempt * 2  # 2s, depois 4s
+                log.debug('%s rate limit em %s, aguardando %ss', source_name, cnpj, wait)
+                time.sleep(wait)
+                continue
+            if r.ok:
+                try:
+                    parsed = parse_fn(r.json())
+                except Exception as e:
+                    log.debug('%s parse falhou em %s: %s', source_name, cnpj, e)
+                    return None
+                if parsed and _is_valid_result(parsed):
+                    return parsed
+                return None
+            break  # outro status code — não retry
+        except Exception as e:
+            log.debug('%s %s tentativa %s falhou: %s', source_name, cnpj, attempt, e)
+            time.sleep(1)
+    return None
+
+
+def fetch_cnae_once(cnpj: str) -> dict:
+    """Tenta consultar CNPJ em 3 fontes em sequência. Só cacheia sucesso."""
+    # Cache só vale se for um resultado real
+    cached = CNAE_CACHE.get(cnpj)
+    if cached and _is_valid_result(cached):
+        return cached
+
+    # 1. BrasilAPI
+    result = _try_api(
+        f'https://brasilapi.com.br/api/cnpj/v1/{cnpj}',
+        _parse_brasilapi, 'BrasilAPI', cnpj,
+    )
+    # 2. CNPJa
+    if not result:
+        result = _try_api(
             f'https://open.cnpja.com/office/{cnpj}',
-            headers=headers, timeout=CNAE_TIMEOUT
+            _parse_cnpja, 'CNPJa', cnpj,
         )
-        if r.ok:
-            d = r.json()
-            main = d.get('mainActivity') or {}
-            sides = d.get('sideActivities') or []
-            side = sides[0] if sides else {}
-            company = d.get('company') or {}
-            result = {
-                'razao_social': company.get('name') or d.get('alias') or '',
-                'cnae1_desc': main.get('text') or '',
-                'cnae2_desc': side.get('text') or '',
-                'source': 'CNPJa',
-            }
-            CNAE_CACHE[cnpj] = result
-            return result
-    except Exception as e:
-        log.debug('CNPJa %s falhou: %s', cnpj, e)
+    # 3. ReceitaWS
+    if not result:
+        result = _try_api(
+            f'https://receitaws.com.br/v1/cnpj/{cnpj}',
+            _parse_receitaws, 'ReceitaWS', cnpj,
+        )
+
+    if result and _is_valid_result(result):
+        CNAE_CACHE[cnpj] = result  # só cacheia se for sucesso real
+        return result
     return {'razao_social': '', 'cnae1_desc': '', 'cnae2_desc': '', 'source': 'ERROR'}
 
 
 def fetch_all_cnaes(cnpjs: list[str]) -> dict[str, dict]:
-    """Busca paralela com cache global. Falhas não bloqueiam o processo."""
+    """Busca paralela em 2 passadas: paralelo + retry sequencial dos que falharam.
+
+    1ª passada: paralelo com CNAE_CONCURRENCY threads, retry em 429 dentro do request.
+    2ª passada: sequencial, espaçada (2s entre cada), recupera o que falhou.
+    Só cacheia sucessos — falhas são re-tentadas em execuções futuras.
+    """
+    EMPTY = {'razao_social': '', 'cnae1_desc': '', 'cnae2_desc': '', 'source': 'ERROR'}
     results = {}
-    to_fetch = [c for c in cnpjs if c not in CNAE_CACHE]
+
+    # Pega do cache somente os sucessos (cache não armazena mais falhas, mas defesa em profundidade)
+    to_fetch = []
     for c in cnpjs:
-        if c in CNAE_CACHE:
-            results[c] = CNAE_CACHE[c]
-    log.info('CNAE: %s no cache, %s a buscar', len(cnpjs) - len(to_fetch), len(to_fetch))
+        cached = CNAE_CACHE.get(c)
+        if cached and _is_valid_result(cached):
+            results[c] = cached
+        else:
+            to_fetch.append(c)
+    log.info('Consulta CNPJ: %s já em cache · %s a buscar',
+             len(cnpjs) - len(to_fetch), len(to_fetch))
     if not to_fetch:
         return results
+
+    # 1ª PASSADA: paralelo
     with ThreadPoolExecutor(max_workers=CNAE_CONCURRENCY) as ex:
         futures = {ex.submit(fetch_cnae_once, c): c for c in to_fetch}
         for fut in as_completed(futures):
             c = futures[fut]
             try:
-                results[c] = fut.result() or {
-                    'razao_social': '', 'cnae1_desc': '', 'cnae2_desc': '', 'source': 'ERROR'
-                }
+                results[c] = fut.result() or dict(EMPTY)
             except Exception as e:
-                log.warning('CNAE fetch erro %s: %s', c, e)
-                results[c] = {'razao_social': '', 'cnae1_desc': '', 'cnae2_desc': '', 'source': 'ERROR'}
+                log.warning('Consulta %s erro: %s', c, e)
+                results[c] = dict(EMPTY)
+
+    falhou = [c for c in to_fetch if not _is_valid_result(results.get(c, {}))]
+    if not falhou:
+        return results
+
+    # 2ª PASSADA: sequencial, espaçada (respeita rate limit)
+    log.info('1ª passada: %s CNPJs falharam. Iniciando 2ª passada sequencial…',
+             len(falhou))
+    for i, c in enumerate(falhou, start=1):
+        time.sleep(2)  # 2s entre consultas
+        data = fetch_cnae_once(c)
+        if _is_valid_result(data):
+            results[c] = data
+            log.debug('2ª passada %s/%s: %s recuperado via %s',
+                      i, len(falhou), c, data.get('source'))
+    recuperados = sum(1 for c in falhou if _is_valid_result(results.get(c, {})))
+    log.info('2ª passada concluída: %s recuperados · %s ainda falharam',
+             recuperados, len(falhou) - recuperados)
     return results
 
 
@@ -608,20 +1054,20 @@ def fetch_all_cnaes(cnpjs: list[str]) -> dict[str, dict]:
 # Os outros CNPJs (col 'cnpj' aqui) são dos PARTICIPANTES (fornecedores/clientes).
 SPED_SCHEMA = {
     'c100efd': {
-        'cols_zero_indexed': [0, 2, 6, 8, 20, 55],  # 1-indexed: 1, 3, 7, 9, 21, 56
-        'names': ['cnpj_empresa', 'periodo', 'cnpj', 'nome', 'nf', 'valor'],
+        'block_key': 'c100efd',
+        'required_fields': ['cnpj', 'nome', 'nf', 'valor'],
         'apply_cst': False,
         'kind': 'nf',
     },
     'a100': {
-        'cols_zero_indexed': [0, 1, 5, 7, 11, 41, 42],  # 1-indexed: 1, 2, 6, 8, 12, 42, 43
-        'names': ['cnpj_empresa', 'periodo', 'cnpj', 'nome', 'nf', 'cst', 'valor'],
+        'block_key': 'a100',
+        'required_fields': ['cnpj', 'nome', 'nf', 'cst', 'valor'],
         'apply_cst': True,
         'kind': 'nf',
     },
     'f100': {
-        'cols_zero_indexed': [0, 1, 4, 6, 15, 22, 23],  # 1-indexed: 1, 2, 5, 7, 16, 23, 24
-        'names': ['cnpj_empresa', 'periodo', 'cnpj', 'nome', 'vlr_operacao', 'cst', 'valor'],
+        'block_key': 'f100',
+        'required_fields': ['cnpj', 'nome', 'vlr_operacao', 'cst', 'valor'],
         'apply_cst': True,
         'kind': 'f100',
     },
@@ -652,20 +1098,119 @@ def _safe_read_excel(file_stream, friendly_name, **kwargs):
         raise ValueError(f'Erro ao ler "{friendly_name}": {e}')
 
 
-def read_sped(file_stream, schema, friendly_name='SPED') -> pd.DataFrame:
+# Padrões de regex (sem acentos, uppercase) pra detectar colunas SPED pelo NOME do cabeçalho.
+# Cada campo lógico tem 1+ regex que tenta casar. Pega o PRIMEIRO match.
+# Isso resolve o problema de layouts variados entre exportadores SPED diferentes.
+SPED_HEADER_PATTERNS = {
+    'c100efd': {
+        'cnpj_empresa': [r'^CNPJ$'],
+        'periodo': [r'^PERIODO$'],
+        'cnpj': [r'CNPJ.*PARTICIPANTE'],
+        'nome': [r'NOME.*PARTICIPANTE'],
+        'nf': [r'NUMERO.*DOCUMENTO', r'\bNUM\b.*\bDOC\b', r'^NUM\s*DOC'],
+        'valor': [r'^VLR\s*ITEM$', r'^VALOR\s*ITEM$'],
+    },
+    'a100': {
+        'cnpj_empresa': [r'^CNPJ$'],
+        'periodo': [r'^PERIODO$'],
+        'cnpj': [r'CNPJ.*PARTICIPANTE'],
+        'nome': [r'NOME.*PARTICIPANTE'],
+        'nf': [r'NUMERO.*DOCUMENTO', r'\bNUM\b.*\bDOC\b'],
+        # CST Cofins (item, NÃO o A100 header)
+        'cst': [r'^CST\s*COFINS$'],
+        # Vlr Base Cálculo Cofins (item) — exclui o "Vlr Base Cálculo Cofins - A100" (header)
+        'valor': [r'^VLR\s*BASE\s*CALCULO\s*COFINS$'],
+    },
+    'f100': {
+        'cnpj_empresa': [r'^CNPJ$'],
+        'periodo': [r'^PERIODO$'],
+        'cnpj': [r'CNPJ.*PARTICIPANTE'],
+        'nome': [r'NOME.*PARTICIPANTE'],
+        'vlr_operacao': [r'^VLR\s*OPERACAO$'],
+        'cst': [r'^CST\s*COFINS$'],
+        'valor': [r'^VLR\s*BASE\s*CALCULO\s*COFINS$'],
+    },
+}
+
+
+def _detect_columns_by_name(headers: list, patterns: dict) -> dict:
+    """Mapeia campo_lógico → índice da coluna procurando pelo nome do header.
+    Retorna dict {campo: índice_0_based} apenas pros campos encontrados.
+
+    Pra campos onde múltiplas colunas casam (ex: cnpj_empresa casa com 'CNPJ Participante'),
+    usa o PRIMEIRO match. Pra cnpj/cnpj_empresa, faz desambiguação especial.
     """
-    Lê um SPED com `usecols` para carregar APENAS as colunas que precisamos.
-    Reduz drasticamente o uso de memória (de 88 cols para 5-6 cols).
+    mapping: dict[str, int] = {}
+    norm_headers = [_normalize_for_keyword(str(h)) for h in headers]
+    for field, regex_list in patterns.items():
+        for idx, h in enumerate(norm_headers):
+            if idx in mapping.values() and field != 'cnpj_empresa':
+                # já mapeado pra outro campo (cnpj_empresa pode aparecer 2x)
+                pass
+            for pat in regex_list:
+                if re.search(pat, h):
+                    if field not in mapping:
+                        mapping[field] = idx
+                    break
+            if field in mapping:
+                break
+    # Especial: cnpj_empresa é a PRIMEIRA col "CNPJ" (sem "PARTICIPANTE")
+    # Re-mapeia se necessário
+    for idx, h in enumerate(norm_headers):
+        if h == 'CNPJ' and mapping.get('cnpj_empresa') != idx:
+            mapping['cnpj_empresa'] = idx
+            break
+    return mapping
+
+
+def read_sped(file_stream, schema, friendly_name='SPED'):
     """
-    df = _safe_read_excel(
-        file_stream,
-        friendly_name=friendly_name,
-        header=0,
-        usecols=schema['cols_zero_indexed'],
-        dtype=object,  # mantém tudo como objeto pra normalizar depois
+    Lê um SPED detectando colunas pelo NOME do cabeçalho (não posição fixa).
+    Funciona com qualquer layout de exportador SPED.
+
+    Retorna (df_full, col_map):
+      • df_full — DataFrame com TODAS as colunas originais (cabeçalhos originais),
+        pra ser escrito completo na aba de bloco (consulta/filtro livre depois).
+      • col_map — dict campo_lógico → índice 0-based da coluna no df_full
+        (cnpj, nf, nome, valor, cst, periodo, vlr_operacao, cnpj_empresa).
+    """
+    # 1) Lê só o cabeçalho pra detectar posições reais das colunas
+    header_df = _safe_read_excel(
+        file_stream, friendly_name=friendly_name, header=0, nrows=0, dtype=object
     )
-    df.columns = schema['names'][:len(df.columns)]
-    return df
+    headers = list(header_df.columns)
+    block_key = schema.get('block_key', 'c100efd')
+    patterns = SPED_HEADER_PATTERNS.get(block_key, {})
+    col_map = _detect_columns_by_name(headers, patterns)
+    log.info('SPED "%s" (%s cols) — colunas detectadas: %s',
+             friendly_name, len(headers), {k: f'{v+1} ({headers[v]})' for k, v in col_map.items()})
+
+    # 2) Valida que campos essenciais foram encontrados
+    required = schema.get('required_fields', list(patterns.keys()))
+    missing = [f for f in required if f not in col_map]
+    if missing:
+        raise ValueError(
+            f'Não consegui localizar as colunas {missing} em "{friendly_name}". '
+            f'Cabeçalhos disponíveis: {", ".join(str(h) for h in headers[:20])}...'
+        )
+
+    # 3) Lê o bloco COMPLETO (todas as colunas) — a usuária quer consultar tudo depois.
+    df_full = _safe_read_excel(
+        file_stream, friendly_name=friendly_name, header=0, dtype=object,
+    )
+    return df_full, col_map
+
+
+def _logical_view(df_full, col_map) -> pd.DataFrame:
+    """Cria um DataFrame só com as colunas lógicas (cnpj, nf, valor, …) a partir
+    do df completo, selecionando por POSIÇÃO (robusto a cabeçalhos duplicados).
+    Usado só pra agregação/cruzamento — a aba de bloco usa o df completo."""
+    data = {}
+    n = len(df_full)
+    for field, idx in col_map.items():
+        if idx is not None and idx < df_full.shape[1]:
+            data[field] = df_full.iloc[:, idx].reset_index(drop=True)
+    return pd.DataFrame(data, index=range(n)) if data else pd.DataFrame()
 
 
 def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'):
@@ -679,7 +1224,8 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
 
     Retorna dict com 'agg', 'agg_no_cred', 'skipped', 'total', 'cnpj_added', 'company_cnpj'.
     """
-    df = read_sped(file_stream, schema, friendly_name=friendly_name)
+    df_full, col_map = read_sped(file_stream, schema, friendly_name=friendly_name)
+    df = _logical_view(df_full, col_map)  # visão lógica só pra agregação
     apply_cst = schema['apply_cst']
     kind = schema['kind']
 
@@ -740,8 +1286,7 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
             _push_f100(target, cnpj_val, per,
                        to_number(row.vlr_operacao), to_number(row.valor))
 
-    total = len(df)
-    del df  # libera memória imediatamente
+    total = len(df_full)
     company_cnpj = (
         max(company_cnpj_count.items(), key=lambda x: x[1])[0]
         if company_cnpj_count else None
@@ -753,6 +1298,8 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
         'total': total,
         'cnpj_added': cnpj_added,
         'company_cnpj': company_cnpj,
+        'df_full': df_full,    # bloco COMPLETO (todas as colunas) pra aba auditável
+        'col_map': col_map,    # campo lógico → índice de coluna no df_full
     }
 
 
@@ -899,30 +1446,33 @@ def build_analise(vlr_partida, val_efd, val_a100, val_f100,
 COLS_ORIGINAIS = 15  # Cols 1-15 da Razão original (até a NF)
 NOVAS_COLS = [
     'Número da Nota',           # 16
-    'Razão Social',             # 17
-    'CNPJ',                     # 18
-    '1º CNAE',                  # 19
-    '2º CNAE',                  # 20
-    'C100 - EFD FISCAL',        # 21
-    'A100 - CONTRI',            # 22
-    'F100 - CONTRI',            # 23
-    'Fecha somando partidas',   # 24 — preenchida só quando match é por soma agregada
-    'Valor da diferença',       # 25 — preenchida só quando há divergência (com sinal)
-    'ANÁLISE DO CRUZAMENTO',    # 26 — status enxuto pra filtrar
+    'Razão Social Extraída',    # 17 — do Complemento Histórico (via tokenização)
+    'CNPJ',                     # 18 — identificado via cascata (4 camadas)
+    'Razão Social Oficial',     # 19 — da BrasilAPI/CNPJa (consulta do CNPJ)
+    '1º CNAE',                  # 20
+    '2º CNAE',                  # 21
+    'C100 - EFD FISCAL',        # 22
+    'A100 - CONTRI',            # 23
+    'F100 - CONTRI',            # 24
+    'Fecha somando partidas',   # 25 — preenchida só quando match é por soma agregada
+    'Valor da diferença',       # 26 — preenchida só quando há divergência (com sinal)
+    'ANÁLISE DO CRUZAMENTO',    # 27 — status enxuto pra filtrar
 ]
-TOTAL_COLS = COLS_ORIGINAIS + len(NOVAS_COLS)  # 26
+TOTAL_COLS = COLS_ORIGINAIS + len(NOVAS_COLS)  # 27
 
 COL_WIDTHS = [
     16, 9, 9, 11, 13, 9, 10, 38, 10, 13, 5, 9, 9, 38, 10,         # originais 1-15
-    14, 38, 20, 48, 48, 16, 16, 16, 44, 18, 38                     # novas 16-26
+    14, 38, 20, 38, 48, 48, 16, 16, 16, 44, 18, 38                 # novas 16-27 (12 cols)
 ]
 
 
 def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_results,
                    razao_partidas_sum=None, razao_partidas_count=None,
                    agg_a100_nc=None, agg_f100_nc=None,
-                   nf_idx_efd=None):
-    """Constrói o workbook com 2 abas (Razão cruzada + Pendências por CNPJ).
+                   nf_idx_efd=None,
+                   df_efd_raw=None, df_a100_raw=None, df_f100_raw=None,
+                   col_efd=None, col_a100=None, col_f100=None):
+    """Constrói o workbook com Razão cruzada + Pendências + 3 abas dos blocos SPED.
 
     `agg_a100_nc` e `agg_f100_nc` são aggregates de NFs SEM crédito (CST fora 50-67).
     Quando uma linha não acha match com crédito mas acha sem crédito, a célula é
@@ -931,6 +1481,12 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     `nf_idx_efd` é o índice NF-only do C100-EFD — usado pra mostrar a presença da NF
     no Fiscal mesmo quando o cruzamento estrito (NF+CNPJ) falhou. Evita que a usuária
     conte essa NF como benefício em duas análises diferentes (duplicidade).
+
+    `df_efd_raw / df_a100_raw / df_f100_raw` são os DataFrames brutos dos SPEDs.
+    Quando passados, são escritos como abas auditáveis (BLOCO_C100-EFD, BLOCO_A100,
+    BLOCO_F100) e as colunas de valor cruzado passam a usar fórmulas SUMIFS apontando
+    pra essas abas — assim a usuária clica na célula e vê exatamente como o valor foi
+    encontrado, podendo navegar pra origem.
     """
     razao_partidas_sum = razao_partidas_sum or {}
     razao_partidas_count = razao_partidas_count or {}
@@ -941,6 +1497,14 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     ws = wb.active
     ws.title = 'RAZÃO CONTABIL'
     styles = make_styles()
+
+    # Nomes das abas auxiliares (referenciadas pelas fórmulas SUMIFS)
+    SHEET_EFD = 'BLOCO_C100-EFD'
+    SHEET_A100 = 'BLOCO_A100'
+    SHEET_F100 = 'BLOCO_F100'
+    use_efd_formula = df_efd_raw is not None and len(df_efd_raw) > 0
+    use_a100_formula = df_a100_raw is not None and len(df_a100_raw) > 0
+    use_f100_formula = df_f100_raw is not None and len(df_f100_raw) > 0
 
     # ----- Cabeçalho -----
     header_src = list(df_razao.columns)[:COLS_ORIGINAIS]
@@ -1013,10 +1577,10 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
         elif cnpj_via == 'DIRETO_HISTORICO':
             stats['cnpj_via_direto'] = stats.get('cnpj_via_direto', 0) + 1
         cnae_data = cnae_results.get(cnpj, {}) if cnpj else {}
-        # Razão Social: prioridade BrasilAPI > extraído
-        razao_social_display = (
-            cnae_data.get('razao_social') or meta['supplier_name'] or ''
-        )
+        # Razão Social Extraída — vinda do Complemento Histórico (tokenização)
+        razao_extraida = meta['supplier_name'] or ''
+        # Razão Social Oficial — vinda da BrasilAPI/CNPJa (consulta do CNPJ)
+        razao_oficial = cnae_data.get('razao_social') or ''
         cnpj_display = format_cnpj(cnpj) if cnpj else '⚠ CNPJ NÃO ENCONTRADO' if meta else ''
         if not cnpj:
             stats['cnpj_missing'] += 1
@@ -1027,20 +1591,24 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
         cell = ws.cell(row=i, column=16, value=nf_display)
         apply_style(cell, styles[nf_style])
 
-        # Col 17: Razão Social
-        cell = ws.cell(row=i, column=17, value=razao_social_display)
+        # Col 17: Razão Social Extraída (do histórico)
+        cell = ws.cell(row=i, column=17, value=razao_extraida)
         apply_style(cell, styles['info'])
 
         # Col 18: CNPJ
         cell = ws.cell(row=i, column=18, value=cnpj_display)
         apply_style(cell, styles['info'] if cnpj else styles['alert'])
 
-        # Col 19: 1º CNAE (descrição completa)
-        cell = ws.cell(row=i, column=19, value=cnae1)
+        # Col 19: Razão Social Oficial (da consulta do CNPJ)
+        cell = ws.cell(row=i, column=19, value=razao_oficial)
         apply_style(cell, styles['info'])
 
-        # Col 20: 2º CNAE
-        cell = ws.cell(row=i, column=20, value=cnae2)
+        # Col 20: 1º CNAE (descrição completa)
+        cell = ws.cell(row=i, column=20, value=cnae1)
+        apply_style(cell, styles['info'])
+
+        # Col 21: 2º CNAE
+        cell = ws.cell(row=i, column=21, value=cnae2)
         apply_style(cell, styles['info'])
 
         # Triple Check
@@ -1078,16 +1646,21 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
                 if partidas_match_efd:
                     stats['partidas_match_efd'] = stats.get('partidas_match_efd', 0) + 1
 
-        # FALLBACK FINAL DO C100-EFD: se o match estrito não pegou MAS a NF existe
-        # no Fiscal, traz o valor informativo. Evita que essa NF apareça como
-        # "Não localizada" aqui e seja contada como benefício em outra análise.
+        # FALLBACK C100-EFD (CNPJ não confirmado) — SÓ quando é SEGURO:
+        # a NF tem UMA única ocorrência no C100 (um único CNPJ) E o valor dela
+        # bate com a Vlr Partida (ou com a soma das partidas, se a NF foi dividida).
+        # Nunca mais somo notas de fornecedores diferentes que só compartilham o
+        # número da NF — era isso que trazia valores que não fechavam.
         if val_efd is None and nf_value:
             candidates = nf_idx_efd.get(nf_value, [])
-            if candidates:
-                # Soma TODAS as ocorrências dessa NF no C100-EFD (qualquer CNPJ).
-                val_efd = round(sum(e['total'] for _, e in candidates), 2)
-                efd_via_nf_only = True
-                stats['efd_via_nf_only'] = stats.get('efd_via_nf_only', 0) + 1
+            if len(candidates) == 1:
+                only_val = round(candidates[0][1]['total'], 2)
+                bate = (abs(only_val - vlr_partida) <= TOLERANCIA_VALOR
+                        or (partidas_count > 1 and abs(only_val - total_partidas) <= TOLERANCIA_VALOR))
+                if bate:
+                    val_efd = only_val
+                    efd_via_nf_only = True
+                    stats['efd_via_nf_only'] = stats.get('efd_via_nf_only', 0) + 1
 
         # A100: mesma lógica de C100-EFD. Se não achar com crédito, tenta sem crédito.
         val_a100 = None
@@ -1139,22 +1712,60 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
                     f100_no_credit = True
                     stats['no_credit_f100'] = stats.get('no_credit_f100', 0) + 1
 
-        # Col 21: C100 - EFD FISCAL
-        cell = ws.cell(row=i, column=21, value=val_efd)
+        # ── Colunas dos blocos: TODA célula com valor vira FÓRMULA auditável ──
+        # Em cada aba BLOCO_*: col A = Chave (CNPJ|NF ou CNPJ|Período), col B = Valor
+        # somado, col C = Com Crédito (1/0), col D (só F100) = Vlr Operação. A fórmula
+        # casa por essas colunas fixas; ROUND(...;2) pra bater com o valor calculado.
+        chave_nf = f'R{i}&"|"&P{i}'  # CNPJ (col R) | NF (col P) — chave de texto
+
+        # Col 22: C100 - EFD FISCAL
+        cell = ws.cell(row=i, column=22, value=val_efd)
+        if val_efd is not None and use_efd_formula:
+            if not efd_via_nf_only:
+                # Match estrito: chave CNPJ|NF (col A) → soma Valor (col B)
+                cell.value = (
+                    f"=IFERROR(ROUND(SUMIFS('{SHEET_EFD}'!B:B,"
+                    f"'{SHEET_EFD}'!A:A,{chave_nf}),2),\"\")"
+                )
+            else:
+                # Fallback NF-only: soma todas as ocorrências dessa NF (col C), qualquer CNPJ
+                cell.value = (
+                    f"=IFERROR(ROUND(SUMIF('{SHEET_EFD}'!C:C,P{i},"
+                    f"'{SHEET_EFD}'!B:B),2),\"\")"
+                )
         if efd_via_nf_only:
             apply_style(cell, styles['value_info'])  # NF localizada sem confirmação de CNPJ
         else:
             apply_style(cell, styles['value_warn'] if diverge_efd else styles['value_ok'])
 
-        # Col 22: A100 - CONTRI (italic se for sem crédito)
-        cell = ws.cell(row=i, column=22, value=val_a100)
+        # Col 23: A100 - CONTRI — chave CNPJ|NF (A) + Valor (B) + Com Crédito (C)
+        cell = ws.cell(row=i, column=23, value=val_a100)
+        if val_a100 is not None and use_a100_formula:
+            cred_flag = 0 if a100_no_credit else 1
+            cell.value = (
+                f"=IFERROR(ROUND(SUMIFS('{SHEET_A100}'!B:B,"
+                f"'{SHEET_A100}'!A:A,{chave_nf},"
+                f"'{SHEET_A100}'!C:C,{cred_flag}),2),\"\")"
+            )
         if a100_no_credit:
             apply_style(cell, styles['value_info'])
         else:
             apply_style(cell, styles['value_warn'] if diverge_a100 else styles['value_ok'])
 
-        # Col 23: F100 - CONTRI (italic se for sem crédito)
-        cell = ws.cell(row=i, column=23, value=val_f100)
+        # Col 24: F100 - CONTRI — chave CNPJ|Período (A) + Valor (B) + Vlr Op tolerância (D) + Crédito (C)
+        cell = ws.cell(row=i, column=24, value=val_f100)
+        if val_f100 is not None and use_f100_formula and periodo:
+            cred_flag = 0 if f100_no_credit else 1
+            lo = vlr_partida - TOLERANCIA_VALOR
+            hi = vlr_partida + TOLERANCIA_VALOR
+            chave_per = f'R{i}&"|{periodo}"'  # CNPJ (col R) | Período (literal)
+            cell.value = (
+                f"=IFERROR(ROUND(SUMIFS('{SHEET_F100}'!B:B,"
+                f"'{SHEET_F100}'!A:A,{chave_per},"
+                f"'{SHEET_F100}'!D:D,\">={lo:.2f}\","
+                f"'{SHEET_F100}'!D:D,\"<={hi:.2f}\","
+                f"'{SHEET_F100}'!C:C,{cred_flag}),2),\"\")"
+            )
         if f100_no_credit:
             apply_style(cell, styles['value_info'])
         else:
@@ -1171,21 +1782,21 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
             efd_via_nf_only=efd_via_nf_only,
         )
 
-        # Col 24: Fecha somando partidas (só preenchida quando match foi via soma)
-        cell = ws.cell(row=i, column=24, value=analise['soma_partidas_text'] or None)
+        # Col 25: Fecha somando partidas (só preenchida quando match foi via soma)
+        cell = ws.cell(row=i, column=25, value=analise['soma_partidas_text'] or None)
         apply_style(cell, styles['info'])
 
-        # Col 25: Valor da diferença (só preenchida quando há divergência)
+        # Col 26: Valor da diferença (só preenchida quando há divergência)
         diff_val = analise['diferenca_value']
-        cell = ws.cell(row=i, column=25, value=diff_val if diff_val is not None else None)
+        cell = ws.cell(row=i, column=26, value=diff_val if diff_val is not None else None)
         if diff_val is not None:
             apply_style(cell, styles['value_warn'])
             cell.number_format = 'R$ #,##0.00;-R$ #,##0.00'
         else:
             apply_style(cell, styles['default'])
 
-        # Col 26: ANÁLISE DO CRUZAMENTO (status enxuto pra filtrar)
-        cell = ws.cell(row=i, column=26, value=analise['analise_text'])
+        # Col 27: ANÁLISE DO CRUZAMENTO (status enxuto pra filtrar)
+        cell = ws.cell(row=i, column=27, value=analise['analise_text'])
         apply_style(cell, styles[analise['analise_style']])
 
         # Stats e pendências
@@ -1196,12 +1807,14 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
         else:
             stats['no_match'] += 1
             # Pendência: agrega por CNPJ (ou marker '__NO_CNPJ__')
+            # Prefere a Razão Social Oficial (BrasilAPI) — mais confiável que a extraída
+            nome_para_pendencia = razao_oficial or razao_extraida
             pkey = cnpj or '__NO_CNPJ__'
             p = pendencias.get(pkey)
             if p is None:
                 p = {
                     'cnpj': cnpj or '',
-                    'nome': razao_social_display,
+                    'nome': nome_para_pendencia,
                     'cnae1': cnae1,
                     'cnae2': cnae2,
                     'total': 0.0,
@@ -1210,8 +1823,8 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
                 pendencias[pkey] = p
             p['total'] += vlr_partida
             p['count'] += 1
-            if not p['nome'] and razao_social_display:
-                p['nome'] = razao_social_display
+            if not p['nome'] and nome_para_pendencia:
+                p['nome'] = nome_para_pendencia
 
     # ----- Ajustes finais da aba RAZÃO -----
     # Larguras
@@ -1274,25 +1887,187 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
 
     stats['pendencias'] = len(pend_list)
     stats['pendencias_total'] = round(pend_total_geral, 2)
+
+    # ----- Abas dos blocos SPED (COMPLETAS + colunas-chave pras fórmulas) -----
+    # Cada aba traz as colunas-chave fixas no início (usadas pelos SUMIFS) seguidas
+    # de TODAS as colunas originais do arquivo importado, pra consulta/filtro livre.
+    if df_efd_raw is not None and len(df_efd_raw) > 0:
+        _write_bloco_full(wb, SHEET_EFD, df_efd_raw, col_efd or {}, styles, kind='efd')
+    if df_a100_raw is not None and len(df_a100_raw) > 0:
+        _write_bloco_full(wb, SHEET_A100, df_a100_raw, col_a100 or {}, styles, kind='a100')
+    if df_f100_raw is not None and len(df_f100_raw) > 0:
+        _write_bloco_full(wb, SHEET_F100, df_f100_raw, col_f100 or {}, styles, kind='f100')
+
     return wb, stats
+
+
+def _cst_to_int(cst_raw):
+    """Converte CST pra int (ou None). Aceita '50', '50.0', 50 etc."""
+    if cst_raw is None or (isinstance(cst_raw, float) and pd.isna(cst_raw)):
+        return None
+    try:
+        return int(float(str(cst_raw).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _clean_cell(v):
+    """Prepara um valor cru do pandas pra escrever no openpyxl (NaN/NaT → None)."""
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
+
+
+def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
+    """Escreve a aba de bloco COMPLETA: colunas-chave fixas no início (usadas pelas
+    FÓRMULAS) + TODAS as colunas originais do arquivo importado (pra consulta/filtro).
+
+    Colunas-chave por bloco:
+      efd:   A=Chave(CNPJ|NF) · B=Valor(num) · C=NF(norm)
+      a100:  A=Chave(CNPJ|NF) · B=Valor(num) · C=Com Crédito(1/0)
+      f100:  A=Chave(CNPJ|Período) · B=Valor(num) · C=Com Crédito(1/0) · D=Vlr Operação(num)
+    Depois dessas, vêm "← BLOCO ORIGINAL →" e todas as colunas do arquivo, com os
+    cabeçalhos originais. A coluna B é o valor que a fórmula soma (já numérico).
+    """
+    ws = wb.create_sheet(sheet_name)
+
+    # Cabeçalhos das colunas-chave (variam por bloco)
+    if kind == 'efd':
+        key_headers = ['Chave (CNPJ|NF)', 'Valor (p/ fórmula)', 'NF (norm.)']
+    elif kind == 'a100':
+        key_headers = ['Chave (CNPJ|NF)', 'Valor (p/ fórmula)', 'Com Crédito (1=sim)']
+    else:  # f100
+        key_headers = ['Chave (CNPJ|Período)', 'Valor (p/ fórmula)',
+                       'Com Crédito (1=sim)', 'Vlr Operação (norm.)']
+    n_key = len(key_headers)
+
+    orig_headers = [str(c) for c in df_full.columns]
+    full_header = key_headers + ['↓ BLOCO ORIGINAL ↓'] + orig_headers
+    sep_col = n_key + 1  # coluna separadora
+    orig_start = n_key + 2
+    for ci, name in enumerate(full_header, start=1):
+        apply_style(ws.cell(row=1, column=ci, value=name), styles['new_header'])
+
+    # Séries lógicas (por posição) → listas, pra montar as colunas-chave rápido
+    def col_list(field):
+        idx = col_map.get(field)
+        if idx is None or idx >= df_full.shape[1]:
+            return None
+        return df_full.iloc[:, idx].tolist()
+
+    cnpj_l = col_list('cnpj')
+    nf_l = col_list('nf')
+    val_l = col_list('valor')
+    cst_l = col_list('cst')
+    per_l = col_list('periodo')
+    vlrop_l = col_list('vlr_operacao')
+
+    nrows = len(df_full)
+    val_col = 2          # coluna do "Valor (p/ fórmula)"
+    vlrop_col = 4 if kind == 'f100' else None
+    # ESCRITA EM LOTE (ws.append) e SEM estilizar célula a célula — as abas de bloco
+    # são pra consulta/filtro; só o cabeçalho leva o estilo EFCT. Isso corta a maior
+    # parte do tempo de geração (antes: centenas de milhares de células estilizadas).
+    for pos, orig_row in enumerate(df_full.itertuples(index=False, name=None)):
+        cnpj_n = normalize_cnpj(cnpj_l[pos]) if cnpj_l else ''
+        cnpj_fmt = format_cnpj(cnpj_n) if len(cnpj_n) == 14 else ''
+        valor = to_number(val_l[pos]) if val_l else 0.0
+
+        if kind == 'efd':
+            nf_n = normalize_nf(nf_l[pos]) if nf_l else ''
+            key_vals = [f'{cnpj_fmt}|{nf_n}', valor, nf_n]
+        elif kind == 'a100':
+            nf_n = normalize_nf(nf_l[pos]) if nf_l else ''
+            cst_i = _cst_to_int(cst_l[pos]) if cst_l else None
+            cred = 1 if (cst_i is not None and 50 <= cst_i <= 67) else 0
+            key_vals = [f'{cnpj_fmt}|{nf_n}', valor, cred]
+        else:  # f100
+            per = to_month_year(per_l[pos]) if per_l else ''
+            cst_i = _cst_to_int(cst_l[pos]) if cst_l else None
+            cred = 1 if (cst_i is not None and 50 <= cst_i <= 67) else 0
+            vlr_op = to_number(vlrop_l[pos]) if vlrop_l else 0.0
+            key_vals = [f'{cnpj_fmt}|{per}', valor, cred, vlr_op]
+
+        # linha = colunas-chave + separador vazio + bloco original inteiro
+        row_out = key_vals + [None] + [_clean_cell(v) for v in orig_row]
+        ws.append(row_out)
+
+    # Formata só as colunas numéricas-chave (rápido — 1-2 colunas) no range usado
+    last_row = nrows + 1
+    if last_row >= 2:
+        for cell in ws[get_column_letter(val_col)][1:]:   # pula o cabeçalho
+            cell.number_format = '#,##0.00'
+        if vlrop_col:
+            for cell in ws[get_column_letter(vlrop_col)][1:]:
+                cell.number_format = '#,##0.00'
+
+    # Larguras: chave largas, valor médio, originais default
+    ws.column_dimensions['A'].width = 30
+    ws.column_dimensions['B'].width = 16
+    ws.column_dimensions[get_column_letter(sep_col)].width = 4
+    for j in range(len(orig_headers)):
+        ws.column_dimensions[get_column_letter(orig_start + j)].width = 18
+    ws.row_dimensions[1].height = 32
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = get_column_letter(orig_start) + '2'  # congela colunas-chave + cabeçalho
+    ws.auto_filter.ref = f'A1:{get_column_letter(len(full_header))}{max(last_row, 1)}'
+    log.info('Aba "%s" escrita: %s linhas × %s colunas (chave + bloco completo)',
+             sheet_name, nrows, len(full_header))
 
 
 # ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
 def processar_cruzamento(
-    razao_stream, c100efd_stream, a100_stream=None, f100_stream=None, skip_cnae=False
+    razao_stream, c100efd_stream, a100_stream=None, f100_stream=None
 ):
     """
     Entrypoint chamado pelo Flask.
     `a100_stream` e `f100_stream` são OPCIONAIS — se a empresa não tem esses blocos,
     o processamento segue só com Razão + C100-EFD (aggregates A100/F100 ficam vazios).
+    A consulta CNPJ → Razão Social Oficial + CNAEs via BrasilAPI/CNPJa é SEMPRE feita
+    quando há CNPJs identificados (não há opção de pular).
     Retorna (bytes_xlsx, dict_stats).
     """
     log.info('Lendo Razão Contábil…')
     df_razao = _safe_read_excel(razao_stream, friendly_name='Razão Contábil',
                                 header=0, dtype=object)
-    log.info('Razão: %s linhas', len(df_razao))
+    log.info('Razão: %s linhas lidas', len(df_razao))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # FILTRO: descarta lançamentos de "Encerramento" se houver coluna Tipo
+    # ─────────────────────────────────────────────────────────────────────
+    # Procura coluna "Tipo de Lançamento" (com variações: Tipo Lanc, Tipo, etc)
+    tipo_col = None
+    for col in df_razao.columns:
+        col_norm = _normalize_for_keyword(str(col))
+        if 'TIPO' in col_norm and 'LANC' in col_norm:
+            tipo_col = col
+            break
+
+    if tipo_col:
+        def _eh_encerramento(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return False
+            s = _normalize_for_keyword(str(v))
+            return 'ENCERR' in s
+        mask_encerr = df_razao[tipo_col].apply(_eh_encerramento)
+        removidas = int(mask_encerr.sum())
+        if removidas > 0:
+            df_razao = df_razao[~mask_encerr].reset_index(drop=True)
+            log.info('Filtro Tipo de Lançamento: %s linhas de ENCERRAMENTO descartadas. Restam %s.',
+                     removidas, len(df_razao))
+        else:
+            log.info('Coluna "%s" detectada — nenhuma linha de encerramento encontrada.', tipo_col)
+    else:
+        log.info('Coluna "Tipo de Lançamento" não encontrada na Razão — sem filtro de encerramento.')
 
     # CNPJ raiz da Razão (col 1, normalmente o mesmo em todas as linhas)
     razao_company_cnpj = _most_common_cnpj(df_razao.iloc[:, 0].tolist())
@@ -1304,6 +2079,8 @@ def processar_cruzamento(
                                friendly_name='C100-EFD FISCAL')
     agg_efd_raw = r_efd['agg']
     efd_company_cnpj = r_efd['company_cnpj']
+    df_efd_raw = r_efd['df_full']
+    col_efd = r_efd['col_map']
     log.info('C100-EFD: %s linhas · %s chaves agregadas', r_efd['total'], len(agg_efd_raw))
 
     if a100_stream is not None:
@@ -1313,6 +2090,8 @@ def processar_cruzamento(
         agg_a100_raw = r_a100['agg']
         agg_a100_nc = r_a100['agg_no_cred'] or {}
         a100_company_cnpj = r_a100['company_cnpj']
+        df_a100_raw = r_a100['df_full']
+        col_a100 = r_a100['col_map']
         log.info('A100: %s linhas · %s sem crédito (CST fora 50-67) · %s chaves com crédito · %s chaves sem crédito',
                  r_a100['total'], r_a100['skipped'], len(agg_a100_raw), len(agg_a100_nc))
     else:
@@ -1320,6 +2099,8 @@ def processar_cruzamento(
         agg_a100_raw = {}
         agg_a100_nc = {}
         a100_company_cnpj = None
+        df_a100_raw = None
+        col_a100 = {}
 
     if f100_stream is not None:
         log.info('Processando F100-CONTRI…')
@@ -1328,6 +2109,8 @@ def processar_cruzamento(
         agg_f100_raw = r_f100['agg']
         agg_f100_nc = r_f100['agg_no_cred'] or {}
         f100_company_cnpj = r_f100['company_cnpj']
+        df_f100_raw = r_f100['df_full']
+        col_f100 = r_f100['col_map']
         log.info('F100: %s linhas · %s sem crédito · %s chaves com crédito · %s chaves sem crédito',
                  r_f100['total'], r_f100['skipped'], len(agg_f100_raw), len(agg_f100_nc))
     else:
@@ -1335,6 +2118,8 @@ def processar_cruzamento(
         agg_f100_raw = {}
         agg_f100_nc = {}
         f100_company_cnpj = None
+        df_f100_raw = None
+        col_f100 = {}
 
     log.info('Mapa CNPJ: %s fornecedores', len(cnpj_map))
     # Avisos proativos quando o mapa pode estar "pobre"
@@ -1412,12 +2197,15 @@ def processar_cruzamento(
         nf_ext = extract_nf_from_historico(complemento, col15_raw=col15)
         supplier_name = extract_supplier_name(complemento)
 
-        # CNPJ — cascata de estratégias (mais confiável primeiro):
-        #   1. CNPJ direto no histórico (formatado ou 14 dígitos)
-        #   2. Nome limpo extraído + lookup_cnpj (exato → fuzzy)
-        #   3. Reverse lookup: varre histórico procurando nomes do mapa SPED
-        #   4. NF-only fallback: se temos a NF, busca nos blocos SPED por essa NF
-        #      (único CNPJ tem ela? usa. Múltiplos? desempata por Vlr Partida.)
+        # CNPJ — cascata GUIADA PELO NOME (estritamente consistente com o histórico):
+        #   1. CNPJ direto no histórico (formatado ou 14 dígitos) — autoridade máxima
+        #   2. Nome extraído → busca o CNPJ no mapa dos BLOCOS SPED (exato→prefixo→fuzzy)
+        #   3. Reverse lookup: nome de fornecedor SPED aparece como texto no histórico
+        #   (a busca web é a 5ª camada, mais abaixo, só pros que sobraram sem CNPJ)
+        #
+        # NÃO inferimos mais CNPJ pela NF nos blocos: isso trazia CNPJ de fornecedor
+        # ERRADO (sem relação com o nome do histórico) e fazia a fórmula somar valores
+        # incoerentes. Regra agora: CNPJ só entra se o NOME fechar com o histórico.
         lookup = None
         direct_cnpj = extract_cnpj_from_historico(complemento)
         if direct_cnpj and len(direct_cnpj) == 14:
@@ -1428,19 +2216,8 @@ def processar_cruzamento(
                 lookup = lookup_cnpj_by_historico_scan(complemento, cnpj_map)
                 if lookup and lookup.get('matched_name') and not supplier_name:
                     supplier_name = lookup['matched_name']
-            if not lookup:
-                # Última tentativa: usa a NF (se identificada) pra buscar nos blocos SPED
-                nf_v = nf_ext.get('value')
-                if nf_v:
-                    lookup = lookup_cnpj_by_nf_in_speds(nf_v, vlr_partida_row, nf_idx_list)
 
         cnpj = lookup['cnpj'] if lookup else None
-        if lookup:
-            via = lookup.get('via', '')
-            if via.startswith('NF_SPED'):
-                # Estatística de quantas foram salvas por esse fallback
-                # (não conta DIRETO_HISTORICO nem HISTORICO_SCAN — só o último recurso)
-                pass  # contador feito no build_workbook
         if cnpj:
             unique_cnpjs.add(cnpj)
         # Acumula partidas por NF+CNPJ (apenas se a NF foi identificada com confiança)
@@ -1456,15 +2233,85 @@ def processar_cruzamento(
             'supplier_name': supplier_name,
             'cnpj': cnpj,
             'cnpj_via': lookup.get('via') if lookup else None,
+            'matched_name': lookup.get('matched_name') if lookup else None,
         })
     log.info('CNPJs únicos a buscar CNAE: %s', len(unique_cnpjs))
 
-    # Busca CNAEs
+    # ─────────────────────────────────────────────────────────────────────
+    # 5ª CAMADA: busca CNPJ via web (DuckDuckGo) pra fornecedores não resolvidos
+    # ─────────────────────────────────────────────────────────────────────
+    # Junta nomes únicos que ficaram sem CNPJ após as 4 camadas anteriores
+    nomes_sem_cnpj = {}  # nome → lista de índices em enriched_list
+    for idx, m in enumerate(enriched_list):
+        if not m or m.get('cnpj'):
+            continue
+        nome = (m.get('supplier_name') or '').strip()
+        if nome and len(nome) >= 8:
+            nomes_sem_cnpj.setdefault(nome, []).append(idx)
+
+    if nomes_sem_cnpj:
+        log.info('5ª camada: buscando %s nomes únicos via web (DuckDuckGo)…',
+                 len(nomes_sem_cnpj))
+        web_found = 0
+        for i, (nome, indices) in enumerate(nomes_sem_cnpj.items(), start=1):
+            time.sleep(WEB_SEARCH_THROTTLE)  # educado com a API
+            result = search_cnpj_by_name_web(nome)
+            if result:
+                cnpj_found = result['cnpj']
+                # Aplica em todas as linhas que tinham esse nome
+                for idx in indices:
+                    enriched_list[idx]['cnpj'] = cnpj_found
+                    enriched_list[idx]['cnpj_via'] = 'WEB_SEARCH'
+                unique_cnpjs.add(cnpj_found)
+                web_found += 1
+            if i % 10 == 0:
+                log.info('Web search progresso: %s/%s · %s achados',
+                         i, len(nomes_sem_cnpj), web_found)
+        log.info('5ª camada concluída: %s/%s nomes resolvidos via web',
+                 web_found, len(nomes_sem_cnpj))
+
+    # Busca CNPJ → Razão Social Oficial + CNAEs (sempre obrigatória quando há CNPJs identificados)
     cnae_results = {}
-    if not skip_cnae and unique_cnpjs:
-        log.info('Buscando CNAEs via BrasilAPI/CNPJa…')
+    if unique_cnpjs:
+        log.info('Consultando %s CNPJs únicos na BrasilAPI/CNPJa (Razão Social Oficial + CNAEs)…',
+                 len(unique_cnpjs))
         cnae_results = fetch_all_cnaes(list(unique_cnpjs))
-        log.info('CNAEs: %s respondidos', len(cnae_results))
+        com_razao = sum(1 for d in cnae_results.values() if d.get('razao_social'))
+        log.info('Consulta concluída: %s respostas · %s com Razão Social Oficial',
+                 len(cnae_results), com_razao)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PORTÃO DE VALIDAÇÃO: CNPJ só permanece se o nome FECHAR com o histórico
+    # ─────────────────────────────────────────────────────────────────────
+    # Para fontes "fracas" (FUZZY/PREFIX/WEB_SEARCH), conferimos se a razão social
+    # oficial (ou o nome casado no SPED) reconcilia com o nome extraído do histórico.
+    # Se não reconciliar, o CNPJ é DESCARTADO — preferimos deixar em branco a trazer
+    # um fornecedor errado que faria a fórmula somar valores incoerentes.
+    rejeitados = 0
+    for m in enriched_list:
+        if not m or not m.get('cnpj'):
+            continue
+        via = m.get('cnpj_via') or ''
+        if via in _TRUSTED_VIAS:
+            continue  # fonte confiável por construção — não precisa validar
+        extraido = m.get('supplier_name') or ''
+        oficial = (cnae_results.get(m['cnpj'], {}) or {}).get('razao_social') or ''
+        casado_sped = m.get('matched_name') or ''
+        # Reconcilia contra o melhor nome disponível (oficial e/ou casado no SPED)
+        nomes_ref = [n for n in (oficial, casado_sped) if n]
+        if not extraido or len(normalize_name(extraido)) < 6 or not nomes_ref:
+            # Não dá pra confirmar consistência de fonte fraca → descarta (seguro)
+            score = 0.0
+        else:
+            score = max(_names_reconcile(extraido, n) for n in nomes_ref)
+        if score < RECONCILE_THRESHOLD:
+            log.info('CNPJ descartado (nome não fecha): histórico="%s" × oficial="%s" (via=%s, score=%.2f)',
+                     extraido[:40], oficial[:40], via, score)
+            m['cnpj'] = None
+            m['cnpj_via'] = 'REJEITADO_NOME'
+            rejeitados += 1
+    if rejeitados:
+        log.info('Portão de validação: %s CNPJs descartados por não fecharem com o histórico.', rejeitados)
 
     # Monta o workbook
     log.info('Montando workbook de saída…')
@@ -1474,7 +2321,10 @@ def processar_cruzamento(
         cnae_results,
         razao_partidas_sum, razao_partidas_count,
         agg_a100_nc=agg_a100_nc, agg_f100_nc=agg_f100_nc,
-        nf_idx_efd=nf_idx_list[0],  # índice NF-only do C100-EFD (já calculado acima)
+        nf_idx_efd=nf_idx_list[0],
+        df_efd_raw=df_efd_raw, col_efd=col_efd,
+        df_a100_raw=df_a100_raw, col_a100=col_a100,
+        df_f100_raw=df_f100_raw, col_f100=col_f100,
     )
     stats['cnaes_buscados'] = len(cnae_results)
 
@@ -1483,5 +2333,42 @@ def processar_cruzamento(
     wb.save(buf)
     out_bytes = buf.getvalue()
     log.info('Saída: %s bytes', len(out_bytes))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # RELATÓRIO DE SANIDADE — alerta proativo se algo parece errado
+    # ─────────────────────────────────────────────────────────────────────
+    total_lin = stats.get('linhas_razao', 0) or 1
+    cnpjs_id = total_lin - stats.get('cnpj_missing', 0)
+    sem_div = stats.get('sem_divergencia', 0)
+    no_match = stats.get('no_match', 0)
+    pct_cnpj = round(cnpjs_id / total_lin * 100, 1)
+    pct_match = round((total_lin - no_match) / total_lin * 100, 1)
+    log.info('===== RELATÓRIO DE SANIDADE =====')
+    log.info('  Linhas da Razão processadas: %s', total_lin)
+    log.info('  CNPJs identificados:         %s (%.1f%%)', cnpjs_id, pct_cnpj)
+    log.info('  Linhas com algum match SPED: %s (%.1f%%)', total_lin - no_match, pct_match)
+    log.info('  Aggregates SPED criados:     EFD=%s · A100(c/cr)=%s · A100(s/cr)=%s · F100(c/cr)=%s · F100(s/cr)=%s',
+             len(agg_efd_raw), len(agg_a100_raw), len(agg_a100_nc),
+             len(agg_f100_raw), len(agg_f100_nc))
+
+    # Alertas proativos
+    alertas = []
+    if pct_cnpj < 50:
+        alertas.append(f'Apenas {pct_cnpj}% dos CNPJs identificados — pode faltar A100/F100 ou nomes muito bagunçados')
+    if pct_match < 30:
+        alertas.append(f'Apenas {pct_match}% das linhas com match — verifique se os SPEDs cobrem o mesmo período da Razão')
+    # Detecta aggregates suspeitos (foram processadas linhas mas 0 chaves geradas)
+    if a100_stream is not None and len(agg_a100_raw) == 0 and len(agg_a100_nc) == 0:
+        alertas.append('A100 processado mas 0 chaves agregadas — possível incompatibilidade de layout (colunas)')
+    if f100_stream is not None and len(agg_f100_raw) == 0 and len(agg_f100_nc) == 0:
+        alertas.append('F100 processado mas 0 chaves agregadas — possível incompatibilidade de layout (colunas)')
+    if len(agg_efd_raw) == 0:
+        alertas.append('C100-EFD processado mas 0 chaves agregadas — possível incompatibilidade de layout (colunas)')
+    if alertas:
+        log.warning('⚠ ALERTAS DE SANIDADE:')
+        for a in alertas:
+            log.warning('  - %s', a)
+    else:
+        log.info('  ✓ Nenhum alerta de sanidade — processamento parece saudável.')
 
     return out_bytes, stats

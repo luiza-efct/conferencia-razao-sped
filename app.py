@@ -50,7 +50,7 @@ def processar():
         c100efd = _real(request.files.get('c100efd'))
         a100 = _real(request.files.get('a100'))  # opcional
         f100 = _real(request.files.get('f100'))  # opcional
-        skip_cnae = request.form.get('skip_cnae', 'false').lower() in ('true', '1', 'on')
+        # Consulta CNPJ→Razão Social/CNAE é SEMPRE feita quando há CNPJ identificado
 
         # Apenas razao + c100efd são obrigatórios. A100/F100 são opcionais —
         # empresas que não escrituram esses blocos podem processar mesmo assim.
@@ -65,11 +65,10 @@ def processar():
             }), 400
 
         app.logger.info(
-            'Iniciando cruzamento: razao=%s c100efd=%s a100=%s f100=%s skip_cnae=%s',
+            'Iniciando cruzamento: razao=%s c100efd=%s a100=%s f100=%s',
             razao.filename, c100efd.filename,
             a100.filename if a100 else '(não enviado)',
             f100.filename if f100 else '(não enviado)',
-            skip_cnae,
         )
 
         out_bytes, stats = processar_cruzamento(
@@ -77,7 +76,6 @@ def processar():
             c100efd_stream=c100efd.stream,
             a100_stream=a100.stream if a100 else None,
             f100_stream=f100.stream if f100 else None,
-            skip_cnae=skip_cnae,
         )
 
         # Nome do arquivo de saída derivado do nome da Razão

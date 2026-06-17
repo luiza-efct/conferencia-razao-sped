@@ -18,6 +18,9 @@ dist/
 # Outputs
 outputs/
 *.log
+test_out.xlsx
+start_server.bat
+server.err.log
 
 # IDEs
 .vscode/
