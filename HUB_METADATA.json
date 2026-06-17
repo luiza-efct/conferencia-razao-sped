@@ -7,7 +7,7 @@
   "tipo_acesso": "Interno",
   "icone_emoji": "🔍",
 
-  "url_producao": "PREENCHER_APOS_DEPLOY",
+  "url_producao": "https://conferencia-razao-sped.onrender.com",
   "plataforma": "Render",
 
   "abertura": {
@@ -34,18 +34,18 @@
   },
 
   "entrega": {
-    "desenvolvido_por": "PREENCHER",
-    "data_entrega": "2026-05-13",
+    "desenvolvido_por": "EFCT - Inovação PIS/COFINS (Claude Code)",
+    "data_entrega": "2026-06-17",
     "stack_utilizada": "Flask + Python 3.11 + pandas + openpyxl + BrasilAPI/CNPJa (Docker em Render)",
-    "repositorio_codigo": "PREENCHER_SE_HOUVER",
+    "repositorio_codigo": "https://github.com/luiza-efct/conferencia-razao-sped",
     "observacoes": "Opção B do manual EFCT — processamento server-side para suportar arquivos SPED grandes (10-100 MB) sem limite de memória do navegador. Dados trafegam via HTTPS para servidor Flask próprio (Render). Consultas CNPJ→CNAE via BrasilAPI com cache em memória."
   },
 
   "validacoes": {
-    "url_acessivel_publicamente": false,
+    "url_acessivel_publicamente": true,
     "padrao_visual_efct_seguido": true,
     "header_hub_efct_presente": true,
-    "testado_em_producao": false,
+    "testado_em_producao": true,
     "sem_credenciais_hardcoded": true,
     "readme_preenchido": true
   }
