@@ -228,6 +228,24 @@ button.secondary:hover{ background:var(--card-info-bg); }
 .stat.danger, .stat.erro{ background:var(--erro-bg); border-color:#f5c2bd; }
 .stat.danger .value, .stat.erro .value{ color:var(--erro); }
 
+/* Alerta de cobertura de período (blocos não cobrem todos os meses da Razão) */
+.period-alert{
+  background:var(--aviso-bg); border:1px solid #e6a23c; border-left:5px solid #e6a23c;
+  border-radius:10px; padding:14px 18px; margin-bottom:18px; color:var(--azul-petroleo);
+}
+.period-alert .pa-title{ font-size:15px; font-weight:700; margin-bottom:6px; }
+.period-alert .pa-sub{ font-size:13px; color:var(--texto-2); margin-bottom:10px; }
+.period-alert ul{ margin:0; padding-left:18px; }
+.period-alert li{ font-size:13px; margin-bottom:8px; line-height:1.5; }
+.period-alert .periodos{
+  display:inline-block; font-family:monospace; font-size:12px; color:#8a5a00;
+  background:rgba(230,162,60,.12); border-radius:4px; padding:2px 6px; margin-top:3px;
+}
+.period-ok{
+  background:var(--sucesso-bg); border:1px solid #b9dbb1; border-left:5px solid var(--sucesso);
+  border-radius:10px; padding:10px 16px; margin-bottom:18px; font-size:13px; color:var(--azul-petroleo);
+}
+
 .legend{
   display:flex; gap:14px; flex-wrap:wrap; font-size:12px;
   color:var(--texto-2); margin:6px 0 16px;
@@ -505,6 +523,7 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
 
 <section class="results" id="results" hidden>
   <h2>Resultado do cruzamento</h2>
+  <div id="periodAlert"></div>
   <div class="stats" id="stats"></div>
 
   <div class="legend">
@@ -710,8 +729,42 @@ async function processAll(){
   }
 }
 
+// --------------- alerta de cobertura de período ---------------
+function renderPeriodAlert(stats){
+  const box = $('#periodAlert');
+  if (!box) return;
+  const blocos = [['efd','C100-EFD FISCAL'], ['a100','A100-CONTRI'], ['f100','F100-CONTRI']];
+
+  if (stats.periodo_alerta === 1){
+    let itens = '';
+    blocos.forEach(([k, nome]) => {
+      const faltam = stats['faltam_' + k];
+      if (faltam){
+        const qtd = stats['qtdfaltam_' + k] || 0;
+        const linhasFora = stats['linhasfora_' + k] || 0;
+        const cob = stats['cob_' + k] || '—';
+        const meses = String(faltam).split(',').join(' · ');
+        itens += `<li><b>${nome}</b> cobre apenas <b>${cob}</b> — faltam <b>${qtd}</b> mês(es) que existem na sua Razão, ` +
+                 `afetando <b>${linhasFora}</b> lançamento(s):<br><span class="periodos">${meses}</span></li>`;
+      }
+    });
+    box.innerHTML =
+      `<div class="period-alert">` +
+      `<div class="pa-title">⚠️ Atenção: os blocos não cobrem todos os períodos da Razão</div>` +
+      `<div class="pa-sub">Sua Razão abrange <b>${stats.periodo_razao || '—'}</b>. Os lançamentos dos meses abaixo ` +
+      `vão aparecer como "não localizados" só porque o bloco daquele período não foi enviado — ` +
+      `os benefícios desses meses NÃO estão corretos até você subir os blocos completos.</div>` +
+      `<ul>${itens}</ul></div>`;
+  } else if (stats.periodo_razao){
+    box.innerHTML = `<div class="period-ok">✓ Cobertura de período OK — os blocos enviados cobrem todos os meses da Razão (${stats.periodo_razao}).</div>`;
+  } else {
+    box.innerHTML = '';
+  }
+}
+
 // --------------- resultados ---------------
 function renderResults(stats){
+  renderPeriodAlert(stats);
   const totalLinhas = stats.linhas_razao || 0;
   const items = [
     { label:'Linhas na Razão', value: totalLinhas },

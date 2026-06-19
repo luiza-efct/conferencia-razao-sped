@@ -2022,6 +2022,37 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
              sheet_name, nrows, len(full_header))
 
 
+def _periodos_de(df_full, periodo_idx):
+    """Conjunto de períodos (MM/AAAA) presentes numa coluna. None se não houver coluna."""
+    if df_full is None or periodo_idx is None or periodo_idx >= df_full.shape[1]:
+        return None
+    pers = set()
+    for v in df_full.iloc[:, periodo_idx].tolist():
+        p = to_month_year(v)
+        if p:
+            pers.add(p)
+    return pers
+
+
+def _ordena_periodos(pers):
+    """Ordena períodos MM/AAAA cronologicamente."""
+    def _k(p):
+        try:
+            mm, yy = p.split('/')
+            return (int(yy), int(mm))
+        except Exception:
+            return (0, 0)
+    return sorted(pers, key=_k)
+
+
+def _faixa_periodos(pers):
+    """'MM/AAAA a MM/AAAA' (ou só um, ou vazio)."""
+    if not pers:
+        return ''
+    o = _ordena_periodos(pers)
+    return o[0] if len(o) == 1 else f'{o[0]} a {o[-1]}'
+
+
 # ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
@@ -2327,6 +2358,52 @@ def processar_cruzamento(
         df_f100_raw=df_f100_raw, col_f100=col_f100,
     )
     stats['cnaes_buscados'] = len(cnae_results)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # COBERTURA DE PERÍODO: Razão × blocos
+    # ─────────────────────────────────────────────────────────────────────
+    # Se um bloco NÃO cobre todos os meses (MM/AAAA) presentes na Razão, os
+    # cruzamentos daqueles meses dariam "não localizado" indevidamente (o bloco
+    # certo não foi enviado). Sinalizamos isso pro front mostrar um alerta.
+    try:
+        from collections import Counter
+        cont = Counter()
+        razao_pers = set()
+        for v in df_razao.iloc[:, 1].tolist():   # col 2 = Período
+            p = to_month_year(v)
+            if p:
+                razao_pers.add(p)
+                cont[p] += 1
+        if razao_pers:
+            stats['periodo_razao'] = _faixa_periodos(razao_pers)
+            alerta = 0
+            blocos = [
+                ('efd', 'C100-EFD FISCAL', df_efd_raw, col_efd, True),
+                ('a100', 'A100-CONTRI', df_a100_raw, col_a100, a100_stream is not None),
+                ('f100', 'F100-CONTRI', df_f100_raw, col_f100, f100_stream is not None),
+            ]
+            for nome, label, dff, cm, enviado in blocos:
+                if not enviado:
+                    continue
+                bp = _periodos_de(dff, (cm or {}).get('periodo'))
+                if bp is None:
+                    stats[f'cob_{nome}'] = 'sem-coluna-periodo'
+                    continue
+                stats[f'cob_{nome}'] = _faixa_periodos(bp) if bp else 'vazio'
+                faltam = _ordena_periodos(razao_pers - bp)
+                if faltam:
+                    alerta = 1
+                    linhas_fora = sum(cont[p] for p in faltam)
+                    stats[f'faltam_{nome}'] = ','.join(faltam[:120])
+                    stats[f'qtdfaltam_{nome}'] = len(faltam)
+                    stats[f'linhasfora_{nome}'] = linhas_fora
+                    log.warning('⚠ PERÍODO: %s não cobre %s mês(es) da Razão (%s lançamentos): %s',
+                                label, len(faltam), linhas_fora, ', '.join(faltam))
+            stats['periodo_alerta'] = alerta
+            if not alerta:
+                log.info('  ✓ Cobertura de período OK — todos os blocos cobrem os meses da Razão.')
+    except Exception as e:
+        log.warning('Não consegui calcular cobertura de período: %s', e)
 
     # Serializa
     buf = io.BytesIO()
