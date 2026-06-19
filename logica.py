@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import requests
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -1474,6 +1475,55 @@ COL_WIDTHS = [
 ]
 
 
+class _StreamSheet:
+    """Faz uma planilha openpyxl em modo write_only (grava em disco em streaming,
+    RAM quase constante) se comportar como uma planilha normal indexada por célula.
+
+    Bufferiza a linha atual e dá flush (append) quando muda de linha — assim o
+    código de escrita continua usando `ws.cell(row, column, value)` + apply_style
+    igual ao modo normal, mas o pico de memória não cresce com o nº de linhas.
+    Atributos de planilha (freeze_panes, auto_filter, column_dimensions, etc.) são
+    repassados pra planilha real.
+    """
+    _PROXY = {'freeze_panes', 'auto_filter', 'sheet_view',
+              'column_dimensions', 'row_dimensions', 'title'}
+
+    def __init__(self, ws):
+        object.__setattr__(self, 'ws', ws)
+        object.__setattr__(self, '_row', None)
+        object.__setattr__(self, '_cells', {})
+
+    def __setattr__(self, name, value):
+        if name in _StreamSheet._PROXY:
+            setattr(self.ws, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    def __getattr__(self, name):
+        return getattr(self.ws, name)
+
+    def cell(self, row, column, value=None):
+        if self._row is None:
+            self._row = row
+        elif row != self._row:
+            self._flush()
+            self._row = row
+        c = WriteOnlyCell(self.ws, value=value)
+        self._cells[column] = c
+        return c
+
+    def _flush(self):
+        if not self._cells:
+            return
+        maxc = max(self._cells)
+        self.ws.append([self._cells.get(c) for c in range(1, maxc + 1)])
+        object.__setattr__(self, '_cells', {})
+
+    def done(self):
+        """Dá flush da última linha bufferizada. Chamar ao terminar a planilha."""
+        self._flush()
+
+
 def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_results,
                    razao_partidas_sum=None, razao_partidas_count=None,
                    agg_a100_nc=None, agg_f100_nc=None,
@@ -1501,9 +1551,9 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     agg_a100_nc = agg_a100_nc or {}
     agg_f100_nc = agg_f100_nc or {}
     nf_idx_efd = nf_idx_efd or {}
-    wb = Workbook()
-    ws = wb.active
-    ws.title = 'RAZÃO CONTABIL'
+    # write_only = gravação em streaming (RAM quase constante mesmo com blocos enormes)
+    wb = Workbook(write_only=True)
+    ws = _StreamSheet(wb.create_sheet('RAZÃO CONTABIL'))
     styles = make_styles()
 
     # Nomes das abas auxiliares (referenciadas pelas fórmulas SUMIFS)
@@ -1513,6 +1563,15 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     use_efd_formula = df_efd_raw is not None and len(df_efd_raw) > 0
     use_a100_formula = df_a100_raw is not None and len(df_a100_raw) > 0
     use_f100_formula = df_f100_raw is not None and len(df_f100_raw) > 0
+
+    # ----- Ajustes da aba (write_only: DEFINIR ANTES de escrever linhas) -----
+    # Larguras, altura do cabeçalho, gridlines e congelamento são gravados no
+    # início do XML da planilha — então têm que vir antes do 1º append.
+    for col_idx, w in enumerate(COL_WIDTHS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = w
+    ws.row_dimensions[1].height = 32
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = 'A2'
 
     # ----- Cabeçalho -----
     header_src = list(df_razao.columns)[:COLS_ORIGINAIS]
@@ -1834,24 +1893,21 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
             if not p['nome'] and nome_para_pendencia:
                 p['nome'] = nome_para_pendencia
 
-    # ----- Ajustes finais da aba RAZÃO -----
-    # Larguras
-    for col_idx, w in enumerate(COL_WIDTHS, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = w
-    # Altura do cabeçalho
-    ws.row_dimensions[1].height = 32
-    # Sem gridlines
-    ws.sheet_view.showGridLines = False
-    # Congelar cabeçalho
-    ws.freeze_panes = 'A2'
-    # Autofiltro
+    # ----- Ajustes finais da aba RAZÃO (só o autofiltro depende do total) -----
     ws.auto_filter.ref = f'A1:{get_column_letter(TOTAL_COLS)}{stats["linhas_razao"] + 1}'
+    ws.done()  # flush da última linha bufferizada
 
     # ----- Aba PENDÊNCIAS DE CRUZAMENTO -----
     pend_total_geral = 0.0
     pend_list = sorted(pendencias.values(), key=lambda x: x['total'], reverse=True)
     if pend_list:
-        ws2 = wb.create_sheet('PENDÊNCIAS DE CRUZAMENTO')
+        ws2 = _StreamSheet(wb.create_sheet('PENDÊNCIAS DE CRUZAMENTO'))
+        # Ajustes da aba ANTES de escrever (write_only)
+        for col_idx, w in enumerate([22, 42, 48, 48, 24, 16], start=1):
+            ws2.column_dimensions[get_column_letter(col_idx)].width = w
+        ws2.row_dimensions[1].height = 32
+        ws2.sheet_view.showGridLines = False
+        ws2.freeze_panes = 'A2'
         pend_header = [
             'CNPJ', 'Razão Social', '1º CNAE', '2º CNAE',
             'Valor Total Não Encontrado', 'Qtd Lançamentos',
@@ -1885,13 +1941,8 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
             apply_style(ws2.cell(row=total_row, column=c), styles['new_header'])
         ws2.cell(row=total_row, column=5).number_format = '#,##0.00'
 
-        # Larguras / vista
-        for col_idx, w in enumerate([22, 42, 48, 48, 24, 16], start=1):
-            ws2.column_dimensions[get_column_letter(col_idx)].width = w
-        ws2.row_dimensions[1].height = 32
-        ws2.sheet_view.showGridLines = False
-        ws2.freeze_panes = 'A2'
         ws2.auto_filter.ref = f'A1:F{len(pend_list) + 1}'
+        ws2.done()  # flush da última linha (total geral)
 
     stats['pendencias'] = len(pend_list)
     stats['pendencias_total'] = round(pend_total_geral, 2)
@@ -1960,8 +2011,24 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
     full_header = key_headers + ['↓ BLOCO ORIGINAL ↓'] + orig_headers
     sep_col = n_key + 1  # coluna separadora
     orig_start = n_key + 2
-    for ci, name in enumerate(full_header, start=1):
-        apply_style(ws.cell(row=1, column=ci, value=name), styles['new_header'])
+
+    # Ajustes da aba ANTES de escrever linhas (write_only grava isso no início do XML)
+    ws.column_dimensions['A'].width = 30
+    ws.column_dimensions['B'].width = 16
+    ws.column_dimensions[get_column_letter(sep_col)].width = 4
+    for j in range(len(orig_headers)):
+        ws.column_dimensions[get_column_letter(orig_start + j)].width = 18
+    ws.row_dimensions[1].height = 32
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = get_column_letter(orig_start) + '2'  # congela colunas-chave + cabeçalho
+
+    # Cabeçalho (write_only: monta a linha de células estilizadas e dá append)
+    hdr_cells = []
+    for name in full_header:
+        hc = WriteOnlyCell(ws, value=name)
+        apply_style(hc, styles['new_header'])
+        hdr_cells.append(hc)
+    ws.append(hdr_cells)
 
     # Séries lógicas (por posição) → listas, pra montar as colunas-chave rápido
     def col_list(field):
@@ -2005,26 +2072,16 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
 
         # linha = colunas-chave + separador vazio + bloco original inteiro
         row_out = key_vals + [None] + [_clean_cell(v) for v in orig_row]
+        # Aplica formato monetário nas colunas numéricas-chave na hora (write_only não
+        # permite mexer na célula depois do append).
+        cB = WriteOnlyCell(ws, value=row_out[val_col - 1]); cB.number_format = '#,##0.00'
+        row_out[val_col - 1] = cB
+        if vlrop_col:
+            cD = WriteOnlyCell(ws, value=row_out[vlrop_col - 1]); cD.number_format = '#,##0.00'
+            row_out[vlrop_col - 1] = cD
         ws.append(row_out)
 
-    # Formata só as colunas numéricas-chave (rápido — 1-2 colunas) no range usado
     last_row = nrows + 1
-    if last_row >= 2:
-        for cell in ws[get_column_letter(val_col)][1:]:   # pula o cabeçalho
-            cell.number_format = '#,##0.00'
-        if vlrop_col:
-            for cell in ws[get_column_letter(vlrop_col)][1:]:
-                cell.number_format = '#,##0.00'
-
-    # Larguras: chave largas, valor médio, originais default
-    ws.column_dimensions['A'].width = 30
-    ws.column_dimensions['B'].width = 16
-    ws.column_dimensions[get_column_letter(sep_col)].width = 4
-    for j in range(len(orig_headers)):
-        ws.column_dimensions[get_column_letter(orig_start + j)].width = 18
-    ws.row_dimensions[1].height = 32
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = get_column_letter(orig_start) + '2'  # congela colunas-chave + cabeçalho
     ws.auto_filter.ref = f'A1:{get_column_letter(len(full_header))}{max(last_row, 1)}'
     log.info('Aba "%s" escrita: %s linhas × %s colunas (chave + bloco completo)',
              sheet_name, nrows, len(full_header))
