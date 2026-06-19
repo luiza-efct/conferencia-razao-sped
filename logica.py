@@ -747,6 +747,14 @@ def _search_cnpjbiz(name: str) -> list[str]:
         return []
 
 
+def _all_sources_blocked() -> bool:
+    """True quando TODAS as fontes web já desistiram (bloqueio anti-bot).
+    Em servidores (IP de datacenter, ex: Render), as 3 fontes caem rápido —
+    aí não adianta continuar tentando/dormindo: a busca web é abortada."""
+    return all(_SOURCE_FAILURES.get(k, 0) >= _SOURCE_BLOCKED_THRESHOLD
+               for k in ('bing', 'ddg', 'cnpjbiz'))
+
+
 def _try_source(src_key: str, search_fn, query: str) -> list[str]:
     """Tenta uma fonte de busca. Se ela está marcada como bloqueada, pula."""
     if _SOURCE_FAILURES.get(src_key, 0) >= _SOURCE_BLOCKED_THRESHOLD:
@@ -2281,25 +2289,36 @@ def processar_cruzamento(
             nomes_sem_cnpj.setdefault(nome, []).append(idx)
 
     if nomes_sem_cnpj:
-        log.info('5ª camada: buscando %s nomes únicos via web (DuckDuckGo)…',
-                 len(nomes_sem_cnpj))
+        log.info('5ª camada: buscando %s nomes únicos via web…', len(nomes_sem_cnpj))
         web_found = 0
+        abortou = False
         for i, (nome, indices) in enumerate(nomes_sem_cnpj.items(), start=1):
-            time.sleep(WEB_SEARCH_THROTTLE)  # educado com a API
+            # Se TODAS as fontes já estão bloqueadas (típico em servidor/Render com
+            # IP de datacenter), aborta a busca — não adianta dormir 3s por nome.
+            if _all_sources_blocked():
+                log.warning('5ª camada ABORTADA: todas as fontes web bloqueadas '
+                            '(IP de servidor). Resolvidos %s/%s antes de abortar em %s.',
+                            web_found, len(nomes_sem_cnpj), i)
+                abortou = True
+                break
             result = search_cnpj_by_name_web(nome)
             if result:
                 cnpj_found = result['cnpj']
-                # Aplica em todas as linhas que tinham esse nome
                 for idx in indices:
                     enriched_list[idx]['cnpj'] = cnpj_found
                     enriched_list[idx]['cnpj_via'] = 'WEB_SEARCH'
                 unique_cnpjs.add(cnpj_found)
                 web_found += 1
+            else:
+                # Só faz a pausa educada se ainda há fonte viva pra tentar
+                if not _all_sources_blocked():
+                    time.sleep(WEB_SEARCH_THROTTLE)
             if i % 10 == 0:
                 log.info('Web search progresso: %s/%s · %s achados',
                          i, len(nomes_sem_cnpj), web_found)
-        log.info('5ª camada concluída: %s/%s nomes resolvidos via web',
-                 web_found, len(nomes_sem_cnpj))
+        if not abortou:
+            log.info('5ª camada concluída: %s/%s nomes resolvidos via web',
+                     web_found, len(nomes_sem_cnpj))
 
     # Busca CNPJ → Razão Social Oficial + CNAEs (sempre obrigatória quando há CNPJs identificados)
     cnae_results = {}
@@ -2404,6 +2423,15 @@ def processar_cruzamento(
                 log.info('  ✓ Cobertura de período OK — todos os blocos cobrem os meses da Razão.')
     except Exception as e:
         log.warning('Não consegui calcular cobertura de período: %s', e)
+
+    # Libera os DataFrames dos blocos ANTES de salvar — eles já foram escritos no
+    # workbook e não são mais necessários. Em arquivos grandes (C100 com milhares
+    # de linhas) isso reduz o pico de memória e evita estourar o limite do servidor.
+    import gc
+    df_efd_raw = df_a100_raw = df_f100_raw = None
+    col_efd = col_a100 = col_f100 = None
+    df_razao = None
+    gc.collect()
 
     # Serializa
     buf = io.BytesIO()
