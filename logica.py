@@ -1177,11 +1177,12 @@ def read_sped(file_stream, schema, friendly_name='SPED'):
     Lê um SPED detectando colunas pelo NOME do cabeçalho (não posição fixa).
     Funciona com qualquer layout de exportador SPED.
 
-    Retorna (df_full, col_map):
-      • df_full — DataFrame com TODAS as colunas originais (cabeçalhos originais),
-        pra ser escrito completo na aba de bloco (consulta/filtro livre depois).
-      • col_map — dict campo_lógico → índice 0-based da coluna no df_full
-        (cnpj, nf, nome, valor, cst, periodo, vlr_operacao, cnpj_empresa).
+    Retorna (df_logico, col_map):
+      • df_logico — DataFrame só com as COLUNAS LÓGICAS renomeadas (cnpj, nf, valor,
+        cst, periodo, vlr_operacao, cnpj_empresa). Pouca memória mesmo em arquivos
+        gigantes — o bloco COMPLETO é lido depois em streaming (openpyxl read_only),
+        sem nunca segurar as 84 colunas × dezenas de milhares de linhas na RAM.
+      • col_map — dict campo_lógico → índice 0-based da coluna no arquivo original.
     """
     # 1) Lê só o cabeçalho pra detectar posições reais das colunas
     header_df = _safe_read_excel(
@@ -1203,23 +1204,18 @@ def read_sped(file_stream, schema, friendly_name='SPED'):
             f'Cabeçalhos disponíveis: {", ".join(str(h) for h in headers[:20])}...'
         )
 
-    # 3) Lê o bloco COMPLETO (todas as colunas) — a usuária quer consultar tudo depois.
-    df_full = _safe_read_excel(
-        file_stream, friendly_name=friendly_name, header=0, dtype=object,
+    # 3) Lê SÓ as colunas lógicas (memória baixa) e renomeia pros nomes lógicos
+    cols_to_read = sorted(set(col_map.values()))
+    df = _safe_read_excel(
+        file_stream, friendly_name=friendly_name, header=0,
+        usecols=cols_to_read, dtype=object,
     )
-    return df_full, col_map
-
-
-def _logical_view(df_full, col_map) -> pd.DataFrame:
-    """Cria um DataFrame só com as colunas lógicas (cnpj, nf, valor, …) a partir
-    do df completo, selecionando por POSIÇÃO (robusto a cabeçalhos duplicados).
-    Usado só pra agregação/cruzamento — a aba de bloco usa o df completo."""
-    data = {}
-    n = len(df_full)
-    for field, idx in col_map.items():
-        if idx is not None and idx < df_full.shape[1]:
-            data[field] = df_full.iloc[:, idx].reset_index(drop=True)
-    return pd.DataFrame(data, index=range(n)) if data else pd.DataFrame()
+    rename_map = {}
+    for field, real_idx in col_map.items():
+        actual_pos = cols_to_read.index(real_idx)
+        rename_map[df.columns[actual_pos]] = field
+    df = df.rename(columns=rename_map)
+    return df, col_map
 
 
 def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'):
@@ -1233,8 +1229,7 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
 
     Retorna dict com 'agg', 'agg_no_cred', 'skipped', 'total', 'cnpj_added', 'company_cnpj'.
     """
-    df_full, col_map = read_sped(file_stream, schema, friendly_name=friendly_name)
-    df = _logical_view(df_full, col_map)  # visão lógica só pra agregação
+    df, col_map = read_sped(file_stream, schema, friendly_name=friendly_name)
     apply_cst = schema['apply_cst']
     kind = schema['kind']
 
@@ -1243,6 +1238,8 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
     skipped = 0  # linhas que foram pro aggregate sem crédito
     cnpj_added = 0
     company_cnpj_count = {}
+    periodos = set()  # períodos (MM/AAAA) presentes no bloco — pra alerta de cobertura
+    has_periodo = 'periodo' in df.columns
 
     def _push_nf(target, nf_n, cnpj_val, value):
         key = f'{nf_n}|{cnpj_val}'
@@ -1267,6 +1264,12 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
             ce_norm = normalize_cnpj(ce_raw)
             if len(ce_norm) == 14:
                 company_cnpj_count[ce_norm] = company_cnpj_count.get(ce_norm, 0) + 1
+
+        # Coleta o período da linha (pra checar cobertura Razão × bloco depois)
+        if has_periodo:
+            _per = to_month_year(getattr(row, 'periodo', None))
+            if _per:
+                periodos.add(_per)
 
         # Decide pra qual aggregate vai a linha
         has_credit = True if not apply_cst else is_credit_cst(row.cst)
@@ -1295,7 +1298,7 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
             _push_f100(target, cnpj_val, per,
                        to_number(row.vlr_operacao), to_number(row.valor))
 
-    total = len(df_full)
+    total = len(df)
     company_cnpj = (
         max(company_cnpj_count.items(), key=lambda x: x[1])[0]
         if company_cnpj_count else None
@@ -1307,8 +1310,8 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
         'total': total,
         'cnpj_added': cnpj_added,
         'company_cnpj': company_cnpj,
-        'df_full': df_full,    # bloco COMPLETO (todas as colunas) pra aba auditável
-        'col_map': col_map,    # campo lógico → índice de coluna no df_full
+        'col_map': col_map,    # campo lógico → índice de coluna no arquivo original
+        'periodos': periodos,  # períodos (MM/AAAA) presentes no bloco
     }
 
 
@@ -1528,7 +1531,7 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
                    razao_partidas_sum=None, razao_partidas_count=None,
                    agg_a100_nc=None, agg_f100_nc=None,
                    nf_idx_efd=None,
-                   df_efd_raw=None, df_a100_raw=None, df_f100_raw=None,
+                   efd_stream=None, a100_stream=None, f100_stream=None,
                    col_efd=None, col_a100=None, col_f100=None):
     """Constrói o workbook com Razão cruzada + Pendências + 3 abas dos blocos SPED.
 
@@ -1560,9 +1563,9 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     SHEET_EFD = 'BLOCO_C100-EFD'
     SHEET_A100 = 'BLOCO_A100'
     SHEET_F100 = 'BLOCO_F100'
-    use_efd_formula = df_efd_raw is not None and len(df_efd_raw) > 0
-    use_a100_formula = df_a100_raw is not None and len(df_a100_raw) > 0
-    use_f100_formula = df_f100_raw is not None and len(df_f100_raw) > 0
+    use_efd_formula = efd_stream is not None
+    use_a100_formula = a100_stream is not None
+    use_f100_formula = f100_stream is not None
 
     # ----- Ajustes da aba (write_only: DEFINIR ANTES de escrever linhas) -----
     # Larguras, altura do cabeçalho, gridlines e congelamento são gravados no
@@ -1947,15 +1950,16 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     stats['pendencias'] = len(pend_list)
     stats['pendencias_total'] = round(pend_total_geral, 2)
 
-    # ----- Abas dos blocos SPED (COMPLETAS + colunas-chave pras fórmulas) -----
+    # ----- Abas dos blocos SPED (COMPLETAS, lidas em STREAMING) -----
     # Cada aba traz as colunas-chave fixas no início (usadas pelos SUMIFS) seguidas
-    # de TODAS as colunas originais do arquivo importado, pra consulta/filtro livre.
-    if df_efd_raw is not None and len(df_efd_raw) > 0:
-        _write_bloco_full(wb, SHEET_EFD, df_efd_raw, col_efd or {}, styles, kind='efd')
-    if df_a100_raw is not None and len(df_a100_raw) > 0:
-        _write_bloco_full(wb, SHEET_A100, df_a100_raw, col_a100 or {}, styles, kind='a100')
-    if df_f100_raw is not None and len(df_f100_raw) > 0:
-        _write_bloco_full(wb, SHEET_F100, df_f100_raw, col_f100 or {}, styles, kind='f100')
+    # de TODAS as colunas originais do arquivo, lidas direto do arquivo em streaming
+    # (sem segurar tudo na RAM) — cabe no plano free mesmo com arquivos gigantes.
+    if efd_stream is not None:
+        _write_bloco_full(wb, SHEET_EFD, efd_stream, col_efd or {}, styles, kind='efd')
+    if a100_stream is not None:
+        _write_bloco_full(wb, SHEET_A100, a100_stream, col_a100 or {}, styles, kind='a100')
+    if f100_stream is not None:
+        _write_bloco_full(wb, SHEET_F100, f100_stream, col_f100 or {}, styles, kind='f100')
 
     return wb, stats
 
@@ -1984,20 +1988,20 @@ def _clean_cell(v):
     return v
 
 
-def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
-    """Escreve a aba de bloco COMPLETA: colunas-chave fixas no início (usadas pelas
-    FÓRMULAS) + TODAS as colunas originais do arquivo importado (pra consulta/filtro).
+def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind):
+    """Escreve a aba de bloco COMPLETA lendo o arquivo em STREAMING (openpyxl
+    read_only) — nunca segura o bloco inteiro na RAM. Funciona com arquivos enormes
+    (dezenas de milhares de linhas × dezenas de colunas) no plano free.
 
-    Colunas-chave por bloco:
+    Colunas-chave fixas no início (usadas pelas FÓRMULAS) + TODAS as colunas
+    originais do arquivo importado (pra consulta/filtro):
       efd:   A=Chave(CNPJ|NF) · B=Valor(num) · C=NF(norm)
       a100:  A=Chave(CNPJ|NF) · B=Valor(num) · C=Com Crédito(1/0)
-      f100:  A=Chave(CNPJ|Período) · B=Valor(num) · C=Com Crédito(1/0) · D=Vlr Operação(num)
-    Depois dessas, vêm "← BLOCO ORIGINAL →" e todas as colunas do arquivo, com os
-    cabeçalhos originais. A coluna B é o valor que a fórmula soma (já numérico).
+      f100:  A=Chave(CNPJ|Período) · B=Valor(num) · C=Com Crédito(1/0) · D=Vlr Operação
     """
+    from openpyxl import load_workbook as _load_ro
     ws = wb.create_sheet(sheet_name)
 
-    # Cabeçalhos das colunas-chave (variam por bloco)
     if kind == 'efd':
         key_headers = ['Chave (CNPJ|NF)', 'Valor (p/ fórmula)', 'NF (norm.)']
     elif kind == 'a100':
@@ -2006,11 +2010,29 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
         key_headers = ['Chave (CNPJ|Período)', 'Valor (p/ fórmula)',
                        'Com Crédito (1=sim)', 'Vlr Operação (norm.)']
     n_key = len(key_headers)
-
-    orig_headers = [str(c) for c in df_full.columns]
-    full_header = key_headers + ['↓ BLOCO ORIGINAL ↓'] + orig_headers
-    sep_col = n_key + 1  # coluna separadora
+    sep_col = n_key + 1
     orig_start = n_key + 2
+    val_col = 2
+    vlrop_col = 4 if kind == 'f100' else None
+
+    i_cnpj = col_map.get('cnpj'); i_nf = col_map.get('nf'); i_val = col_map.get('valor')
+    i_cst = col_map.get('cst'); i_per = col_map.get('periodo'); i_op = col_map.get('vlr_operacao')
+
+    def g(vals, idx):
+        return vals[idx] if (idx is not None and idx < len(vals)) else None
+
+    # Abre o arquivo em modo read_only (streaming, lazy) — não carrega tudo na RAM
+    if hasattr(file_stream, 'seek'):
+        file_stream.seek(0)
+    wb_in = _load_ro(file_stream, read_only=True, data_only=True)
+    src = wb_in.active
+    rows_iter = src.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        header_row = ()
+    orig_headers = [(str(h) if h is not None else '') for h in header_row]
+    full_header = key_headers + ['↓ BLOCO ORIGINAL ↓'] + orig_headers
 
     # Ajustes da aba ANTES de escrever linhas (write_only grava isso no início do XML)
     ws.column_dimensions['A'].width = 30
@@ -2020,9 +2042,8 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
         ws.column_dimensions[get_column_letter(orig_start + j)].width = 18
     ws.row_dimensions[1].height = 32
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = get_column_letter(orig_start) + '2'  # congela colunas-chave + cabeçalho
+    ws.freeze_panes = get_column_letter(orig_start) + '2'
 
-    # Cabeçalho (write_only: monta a linha de células estilizadas e dá append)
     hdr_cells = []
     for name in full_header:
         hc = WriteOnlyCell(ws, value=name)
@@ -2030,50 +2051,29 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
         hdr_cells.append(hc)
     ws.append(hdr_cells)
 
-    # Séries lógicas (por posição) → listas, pra montar as colunas-chave rápido
-    def col_list(field):
-        idx = col_map.get(field)
-        if idx is None or idx >= df_full.shape[1]:
-            return None
-        return df_full.iloc[:, idx].tolist()
-
-    cnpj_l = col_list('cnpj')
-    nf_l = col_list('nf')
-    val_l = col_list('valor')
-    cst_l = col_list('cst')
-    per_l = col_list('periodo')
-    vlrop_l = col_list('vlr_operacao')
-
-    nrows = len(df_full)
-    val_col = 2          # coluna do "Valor (p/ fórmula)"
-    vlrop_col = 4 if kind == 'f100' else None
-    # ESCRITA EM LOTE (ws.append) e SEM estilizar célula a célula — as abas de bloco
-    # são pra consulta/filtro; só o cabeçalho leva o estilo EFCT. Isso corta a maior
-    # parte do tempo de geração (antes: centenas de milhares de células estilizadas).
-    for pos, orig_row in enumerate(df_full.itertuples(index=False, name=None)):
-        cnpj_n = normalize_cnpj(cnpj_l[pos]) if cnpj_l else ''
+    nrows = 0
+    for vals in rows_iter:
+        nrows += 1
+        cnpj_n = normalize_cnpj(g(vals, i_cnpj))
         cnpj_fmt = format_cnpj(cnpj_n) if len(cnpj_n) == 14 else ''
-        valor = to_number(val_l[pos]) if val_l else 0.0
+        valor = to_number(g(vals, i_val))
 
         if kind == 'efd':
-            nf_n = normalize_nf(nf_l[pos]) if nf_l else ''
+            nf_n = normalize_nf(g(vals, i_nf))
             key_vals = [f'{cnpj_fmt}|{nf_n}', valor, nf_n]
         elif kind == 'a100':
-            nf_n = normalize_nf(nf_l[pos]) if nf_l else ''
-            cst_i = _cst_to_int(cst_l[pos]) if cst_l else None
+            nf_n = normalize_nf(g(vals, i_nf))
+            cst_i = _cst_to_int(g(vals, i_cst))
             cred = 1 if (cst_i is not None and 50 <= cst_i <= 67) else 0
             key_vals = [f'{cnpj_fmt}|{nf_n}', valor, cred]
         else:  # f100
-            per = to_month_year(per_l[pos]) if per_l else ''
-            cst_i = _cst_to_int(cst_l[pos]) if cst_l else None
+            per = to_month_year(g(vals, i_per))
+            cst_i = _cst_to_int(g(vals, i_cst))
             cred = 1 if (cst_i is not None and 50 <= cst_i <= 67) else 0
-            vlr_op = to_number(vlrop_l[pos]) if vlrop_l else 0.0
+            vlr_op = to_number(g(vals, i_op))
             key_vals = [f'{cnpj_fmt}|{per}', valor, cred, vlr_op]
 
-        # linha = colunas-chave + separador vazio + bloco original inteiro
-        row_out = key_vals + [None] + [_clean_cell(v) for v in orig_row]
-        # Aplica formato monetário nas colunas numéricas-chave na hora (write_only não
-        # permite mexer na célula depois do append).
+        row_out = key_vals + [None] + [_clean_cell(v) for v in vals]
         cB = WriteOnlyCell(ws, value=row_out[val_col - 1]); cB.number_format = '#,##0.00'
         row_out[val_col - 1] = cB
         if vlrop_col:
@@ -2081,22 +2081,9 @@ def _write_bloco_full(wb, sheet_name, df_full, col_map, styles, kind):
             row_out[vlrop_col - 1] = cD
         ws.append(row_out)
 
-    last_row = nrows + 1
-    ws.auto_filter.ref = f'A1:{get_column_letter(len(full_header))}{max(last_row, 1)}'
-    log.info('Aba "%s" escrita: %s linhas × %s colunas (chave + bloco completo)',
-             sheet_name, nrows, len(full_header))
-
-
-def _periodos_de(df_full, periodo_idx):
-    """Conjunto de períodos (MM/AAAA) presentes numa coluna. None se não houver coluna."""
-    if df_full is None or periodo_idx is None or periodo_idx >= df_full.shape[1]:
-        return None
-    pers = set()
-    for v in df_full.iloc[:, periodo_idx].tolist():
-        p = to_month_year(v)
-        if p:
-            pers.add(p)
-    return pers
+    wb_in.close()
+    ws.auto_filter.ref = f'A1:{get_column_letter(len(full_header))}{max(nrows + 1, 1)}'
+    log.info('Aba "%s" (streaming): %s linhas × %s colunas', sheet_name, nrows, len(full_header))
 
 
 def _ordena_periodos(pers):
@@ -2175,8 +2162,8 @@ def processar_cruzamento(
                                friendly_name='C100-EFD FISCAL')
     agg_efd_raw = r_efd['agg']
     efd_company_cnpj = r_efd['company_cnpj']
-    df_efd_raw = r_efd['df_full']
     col_efd = r_efd['col_map']
+    periodos_efd = r_efd['periodos']
     log.info('C100-EFD: %s linhas · %s chaves agregadas', r_efd['total'], len(agg_efd_raw))
 
     if a100_stream is not None:
@@ -2186,8 +2173,8 @@ def processar_cruzamento(
         agg_a100_raw = r_a100['agg']
         agg_a100_nc = r_a100['agg_no_cred'] or {}
         a100_company_cnpj = r_a100['company_cnpj']
-        df_a100_raw = r_a100['df_full']
         col_a100 = r_a100['col_map']
+        periodos_a100 = r_a100['periodos']
         log.info('A100: %s linhas · %s sem crédito (CST fora 50-67) · %s chaves com crédito · %s chaves sem crédito',
                  r_a100['total'], r_a100['skipped'], len(agg_a100_raw), len(agg_a100_nc))
     else:
@@ -2195,8 +2182,8 @@ def processar_cruzamento(
         agg_a100_raw = {}
         agg_a100_nc = {}
         a100_company_cnpj = None
-        df_a100_raw = None
         col_a100 = {}
+        periodos_a100 = set()
 
     if f100_stream is not None:
         log.info('Processando F100-CONTRI…')
@@ -2205,8 +2192,8 @@ def processar_cruzamento(
         agg_f100_raw = r_f100['agg']
         agg_f100_nc = r_f100['agg_no_cred'] or {}
         f100_company_cnpj = r_f100['company_cnpj']
-        df_f100_raw = r_f100['df_full']
         col_f100 = r_f100['col_map']
+        periodos_f100 = r_f100['periodos']
         log.info('F100: %s linhas · %s sem crédito · %s chaves com crédito · %s chaves sem crédito',
                  r_f100['total'], r_f100['skipped'], len(agg_f100_raw), len(agg_f100_nc))
     else:
@@ -2214,8 +2201,8 @@ def processar_cruzamento(
         agg_f100_raw = {}
         agg_f100_nc = {}
         f100_company_cnpj = None
-        df_f100_raw = None
         col_f100 = {}
+        periodos_f100 = set()
 
     log.info('Mapa CNPJ: %s fornecedores', len(cnpj_map))
     # Avisos proativos quando o mapa pode estar "pobre"
@@ -2429,9 +2416,9 @@ def processar_cruzamento(
         razao_partidas_sum, razao_partidas_count,
         agg_a100_nc=agg_a100_nc, agg_f100_nc=agg_f100_nc,
         nf_idx_efd=nf_idx_list[0],
-        df_efd_raw=df_efd_raw, col_efd=col_efd,
-        df_a100_raw=df_a100_raw, col_a100=col_a100,
-        df_f100_raw=df_f100_raw, col_f100=col_f100,
+        efd_stream=c100efd_stream, col_efd=col_efd,
+        a100_stream=a100_stream, col_a100=col_a100,
+        f100_stream=f100_stream, col_f100=col_f100,
     )
     stats['cnaes_buscados'] = len(cnae_results)
 
@@ -2454,18 +2441,17 @@ def processar_cruzamento(
             stats['periodo_razao'] = _faixa_periodos(razao_pers)
             alerta = 0
             blocos = [
-                ('efd', 'C100-EFD FISCAL', df_efd_raw, col_efd, True),
-                ('a100', 'A100-CONTRI', df_a100_raw, col_a100, a100_stream is not None),
-                ('f100', 'F100-CONTRI', df_f100_raw, col_f100, f100_stream is not None),
+                ('efd', 'C100-EFD FISCAL', periodos_efd, True),
+                ('a100', 'A100-CONTRI', periodos_a100, a100_stream is not None),
+                ('f100', 'F100-CONTRI', periodos_f100, f100_stream is not None),
             ]
-            for nome, label, dff, cm, enviado in blocos:
+            for nome, label, bp, enviado in blocos:
                 if not enviado:
                     continue
-                bp = _periodos_de(dff, (cm or {}).get('periodo'))
-                if bp is None:
+                if not bp:
                     stats[f'cob_{nome}'] = 'sem-coluna-periodo'
                     continue
-                stats[f'cob_{nome}'] = _faixa_periodos(bp) if bp else 'vazio'
+                stats[f'cob_{nome}'] = _faixa_periodos(bp)
                 faltam = _ordena_periodos(razao_pers - bp)
                 if faltam:
                     alerta = 1
@@ -2481,12 +2467,9 @@ def processar_cruzamento(
     except Exception as e:
         log.warning('Não consegui calcular cobertura de período: %s', e)
 
-    # Libera os DataFrames dos blocos ANTES de salvar — eles já foram escritos no
-    # workbook e não são mais necessários. Em arquivos grandes (C100 com milhares
-    # de linhas) isso reduz o pico de memória e evita estourar o limite do servidor.
+    # Libera a Razão e dá um gc antes de salvar (os blocos já são streaming, não há
+    # DataFrame grande na memória — o pico fica baixo mesmo em arquivos enormes).
     import gc
-    df_efd_raw = df_a100_raw = df_f100_raw = None
-    col_efd = col_a100 = col_f100 = None
     df_razao = None
     gc.collect()
 
