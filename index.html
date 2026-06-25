@@ -246,6 +246,33 @@ button.secondary:hover{ background:var(--card-info-bg); }
   border-radius:10px; padding:10px 16px; margin-bottom:18px; font-size:13px; color:var(--azul-petroleo);
 }
 
+/* Painel de conferência do padrão do histórico */
+.pattern-confirm{
+  background:var(--card-bg); border:1px solid var(--borda); border-radius:14px;
+  padding:22px 24px; margin-top:18px;
+}
+.pattern-confirm h2{ margin:0 0 6px; font-size:18px; color:var(--azul-petroleo); }
+.pc-help{ font-size:13px; color:var(--texto-2); margin:0 0 16px; line-height:1.5; }
+.pc-strategy{ display:flex; gap:12px; align-items:flex-start; margin-bottom:14px; }
+.pc-badge{
+  flex:none; background:var(--azul-petroleo); color:var(--verde-oliva); font-weight:700;
+  font-size:12px; padding:6px 10px; border-radius:8px; white-space:nowrap;
+}
+.pc-strat-label{ font-weight:700; color:var(--azul-petroleo); font-size:15px; }
+.pc-strat-desc{ font-size:13px; color:var(--texto-2); margin-top:2px; line-height:1.45; }
+.pc-table-wrap{ max-height:340px; overflow:auto; border:1px solid var(--borda); border-radius:10px; }
+.pc-table{ width:100%; border-collapse:collapse; font-size:12.5px; }
+.pc-table thead th{
+  position:sticky; top:0; background:var(--azul-petroleo); color:var(--verde-oliva);
+  text-align:left; padding:9px 12px; font-weight:600; z-index:1;
+}
+.pc-table td{ padding:8px 12px; border-top:1px solid var(--borda); color:var(--azul-petroleo); vertical-align:top; }
+.pc-table tbody tr:nth-child(even){ background:var(--card-bg-soft); }
+.pc-table .pc-nf{ font-family:monospace; font-weight:600; white-space:nowrap; }
+.pc-table .pc-razao{ font-weight:600; }
+.pc-table .pc-vazio{ color:var(--erro); font-style:italic; }
+.pc-actions{ display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
+
 .legend{
   display:flex; gap:14px; flex-wrap:wrap; font-size:12px;
   color:var(--texto-2); margin:6px 0 16px;
@@ -516,10 +543,36 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
 </div>
 
 <div class="actions">
-  <button id="btnProcess" class="primary" disabled>Processar cruzamento</button>
+  <button id="btnProcess" class="primary" disabled>Conferir padrão do histórico</button>
   <button id="btnReset" class="secondary" type="button">Limpar tudo</button>
   <span class="status-bar" id="statusBar">Selecione Razão Contábil + C100-EFD FISCAL (obrigatórios) para liberar o botão. A100 e F100 são opcionais.</span>
 </div>
+
+<section class="pattern-confirm" id="patternConfirm" hidden>
+  <h2>1. Confira o padrão do Complemento Histórico</h2>
+  <p class="pc-help">Antes de cruzar tudo (o que leva alguns minutos), confira se a ferramenta
+  está lendo certo o <b>número da NF</b> e a <b>razão social</b> do histórico. Se estiver certo,
+  clique <b>“Está certo, processar”</b>. Se não, clique <b>“Repensar padrão”</b> que ela tenta
+  outra forma de leitura.</p>
+  <div class="pc-strategy">
+    <span class="pc-badge" id="pcBadge">Leitura 1/5</span>
+    <div>
+      <div class="pc-strat-label" id="pcStratLabel">—</div>
+      <div class="pc-strat-desc" id="pcStratDesc">—</div>
+    </div>
+  </div>
+  <div class="pc-table-wrap">
+    <table class="pc-table" id="pcTable">
+      <thead><tr><th>Complemento Histórico</th><th>NF identificada</th><th>Razão Social identificada</th></tr></thead>
+      <tbody id="pcTableBody"></tbody>
+    </table>
+  </div>
+  <div class="pc-actions">
+    <button id="btnPatternOk" class="primary" type="button">✓ Está certo, processar</button>
+    <button id="btnPatternRethink" class="secondary" type="button">↻ Repensar padrão (outra leitura)</button>
+    <button id="btnPatternCancel" class="secondary" type="button">Cancelar</button>
+  </div>
+</section>
 
 <section class="results" id="results" hidden>
   <h2>Resultado do cruzamento</h2>
@@ -562,6 +615,8 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
  */
 
 const FILES = { razao: null, c100efd: null, a100: null, f100: null };
+let CURRENT_STRATEGY = 0;        // leitura do histórico aprovada/em conferência
+let TOTAL_STRATEGIES = 5;
 
 // --------------- helpers de UI ---------------
 function $(s){ return document.querySelector(s); }
@@ -651,9 +706,56 @@ function setProgress(msg, sub=''){
 }
 function hideProgress(){ $('#progress').classList.remove('active'); }
 
+function escHtml(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+// --------------- etapa 1: conferência do padrão do histórico ---------------
+async function previewPattern(){
+  if (!FILES.razao){ return; }
+  showProgress('Lendo a Razão para conferir o padrão…', 'Só uma amostra — é rápido');
+  try {
+    const fd = new FormData();
+    fd.append('razao', FILES.razao);
+    fd.append('estrategia', String(CURRENT_STRATEGY));
+    const resp = await fetch('/api/preview', { method:'POST', body: fd });
+    hideProgress();
+    if (!resp.ok){
+      let m = `HTTP ${resp.status}`;
+      try { m = (await resp.json()).erro || m; } catch {}
+      throw new Error(m);
+    }
+    const data = await resp.json();
+    CURRENT_STRATEGY = data.estrategia_idx;
+    TOTAL_STRATEGIES = data.total_estrategias;
+    renderPattern(data);
+    $('#patternConfirm').hidden = false;
+    $('#patternConfirm').scrollIntoView({ behavior:'smooth', block:'start' });
+  } catch (err){
+    hideProgress();
+    $('#statusBar').textContent = 'Erro ao conferir padrão: ' + (err.message || err);
+    $('#statusBar').className = 'status-bar err';
+  }
+}
+
+function renderPattern(data){
+  $('#pcBadge').textContent = `Leitura ${data.estrategia_idx + 1}/${data.total_estrategias}`;
+  $('#pcStratLabel').textContent = data.estrategia_label;
+  $('#pcStratDesc').textContent = data.estrategia_descricao;
+  const linhas = (data.amostras || []).map(a => {
+    const nf = a.nf === '—' ? '<span class="pc-vazio">não identificada</span>' : escHtml(a.nf);
+    const rz = a.razao === '—' ? '<span class="pc-vazio">não identificada</span>' : escHtml(a.razao);
+    return `<tr><td>${escHtml(a.historico)}</td><td class="pc-nf">${nf}</td><td class="pc-razao">${rz}</td></tr>`;
+  }).join('');
+  $('#pcTableBody').innerHTML = linhas || '<tr><td colspan="3">Nenhum histórico encontrado na Razão.</td></tr>';
+}
+
 // --------------- core: chamada ao backend ---------------
 async function processAll(){
-  showProgress('Enviando arquivos para o servidor…', 'Aguardando processamento (pode levar 10–60s)');
+  $('#patternConfirm').hidden = true;   // sai da etapa de conferência
+  showProgress('Enviando arquivos para o servidor…', 'Processando — pode levar alguns minutos em arquivos grandes');
 
   // simula uma sub-mensagem que vai trocando enquanto o backend processa
   let tick = 0;
@@ -683,6 +785,7 @@ async function processAll(){
     // A100 e F100 são opcionais — só envia se preenchido
     if (FILES.a100) fd.append('a100', FILES.a100);
     if (FILES.f100) fd.append('f100', FILES.f100);
+    fd.append('estrategia', String(CURRENT_STRATEGY));  // leitura do histórico aprovada
     // Consulta CNPJ→Razão Social/CNAE é sempre obrigatória — sem opção de pular
 
     const resp = await fetch('/api/processar', { method: 'POST', body: fd });
@@ -819,6 +922,8 @@ function resetAll(){
     c.querySelector('input[type=file]').value = '';
   });
   $('#results').hidden = true;
+  $('#patternConfirm').hidden = true;
+  CURRENT_STRATEGY = 0;
   window.__resultBlob = null;
   refreshState();
 }
@@ -826,7 +931,16 @@ function resetAll(){
 // --------------- init ---------------
 document.addEventListener('DOMContentLoaded', () => {
   $$('.upload-card').forEach(attachUpload);
-  $('#btnProcess').addEventListener('click', processAll);
+  // Etapa 1: o botão principal abre a conferência do padrão (não processa direto)
+  $('#btnProcess').addEventListener('click', () => { CURRENT_STRATEGY = 0; previewPattern(); });
+  // Etapa 2: aprovar o padrão → processa tudo com a leitura escolhida
+  $('#btnPatternOk').addEventListener('click', processAll);
+  // Repensar → próxima leitura (cicla) e mostra de novo
+  $('#btnPatternRethink').addEventListener('click', () => {
+    CURRENT_STRATEGY = (CURRENT_STRATEGY + 1) % TOTAL_STRATEGIES;
+    previewPattern();
+  });
+  $('#btnPatternCancel').addEventListener('click', () => { $('#patternConfirm').hidden = true; });
   $('#btnDownload').addEventListener('click', downloadResult);
   $('#btnReset').addEventListener('click', resetAll);
 });

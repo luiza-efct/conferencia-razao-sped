@@ -9,7 +9,7 @@ import traceback
 
 from flask import Flask, request, send_file, jsonify, Response
 
-from logica import processar_cruzamento
+from logica import processar_cruzamento, preview_padrao
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,18 +33,46 @@ def health():
     return jsonify({'status': 'ok'})
 
 
+def _real(fs):
+    """Returns FileStorage só se um arquivo real foi enviado (filename não vazio)."""
+    if fs is None or not getattr(fs, 'filename', None) or not fs.filename.strip():
+        return None
+    return fs
+
+
+@app.route('/api/preview', methods=['POST'])
+def preview():
+    """
+    Etapa de CONFERÊNCIA do padrão: recebe só a Razão + um índice de estratégia e
+    devolve uma amostra (Complemento Histórico → NF + Razão Social) pra a usuária
+    aprovar ("OK") ou pedir outra leitura ("Repensar" → próxima estratégia).
+    Não processa os blocos — é rápido.
+    """
+    try:
+        razao = _real(request.files.get('razao'))
+        if not razao:
+            return jsonify({'erro': 'Envie a Razão Contábil para conferir o padrão.'}), 400
+        try:
+            estrategia = int(request.form.get('estrategia', 0))
+        except (TypeError, ValueError):
+            estrategia = 0
+        resultado = preview_padrao(razao.stream, estrategia=estrategia)
+        return jsonify(resultado)
+    except ValueError as e:
+        app.logger.warning('Preview falhou: %s', e)
+        return jsonify({'erro': str(e)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        app.logger.error('Erro no preview: %s', e)
+        return jsonify({'erro': f'Erro ao gerar a prévia: {str(e)}'}), 500
+
+
 @app.route('/api/processar', methods=['POST'])
 def processar():
     """
     Recebe 4 arquivos (razao, c100efd, a100, f100) via multipart/form-data
     e devolve o xlsx cruzado com as 2 abas (RAZÃO CONTABIL + PENDÊNCIAS DE CRUZAMENTO).
     """
-    def _real(fs):
-        """Returns FileStorage só se um arquivo real foi enviado (filename não vazio)."""
-        if fs is None or not getattr(fs, 'filename', None) or not fs.filename.strip():
-            return None
-        return fs
-
     try:
         razao = _real(request.files.get('razao'))
         c100efd = _real(request.files.get('c100efd'))
@@ -71,11 +99,17 @@ def processar():
             f100.filename if f100 else '(não enviado)',
         )
 
+        try:
+            estrategia = int(request.form.get('estrategia', 0))
+        except (TypeError, ValueError):
+            estrategia = 0
+
         out_bytes, stats = processar_cruzamento(
             razao_stream=razao.stream,
             c100efd_stream=c100efd.stream,
             a100_stream=a100.stream if a100 else None,
             f100_stream=f100.stream if f100 else None,
+            estrategia=estrategia,
         )
 
         # Nome do arquivo de saída derivado do nome da Razão

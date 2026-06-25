@@ -480,16 +480,25 @@ def tokenize_historico(historico: str) -> list:
     return out
 
 
-def smart_extract(historico, col15_raw=None) -> dict:
-    """Extrai NF + nome do fornecedor por classificação semântica dos tokens.
+def smart_extract(historico, col15_raw=None, strategy=0) -> dict:
+    """Extrai NF + nome do fornecedor do Complemento Histórico.
 
-    Funciona em históricos sem padrão fixo — não precisa de regex específica
-    pra cada formato. Cada token é classificado e a NF é o primeiro NUMBER
-    "plausível" (3–10 dígitos), com bônus se vier após uma KEYWORD fiscal
-    ou NF_MARKER. Todos os tokens classificados como NAME formam a Razão Social.
-
-    Retorna: {'value', 'status', 'candidates', 'name'}.
+    `strategy` escolhe COMO ler o histórico (a usuária confirma o padrão certo na
+    tela antes de processar; cada clique em "Repensar" avança pra próxima leitura):
+      0 — Tokenização inteligente (padrão)
+      1 — Nome após "de/da/do" (ex: 'NFSE nr 3607 de CLINISEG...')
+      2 — Nome antes do primeiro número
+      3 — Nome = maior trecho de texto (ignora posição)
+      4 — NF da coluna do arquivo + nome = histórico limpo
+    Retorna sempre: {'value', 'status', 'candidates', 'name'}.
     """
+    fn = EXTRACTION_STRATEGIES[strategy % len(EXTRACTION_STRATEGIES)]['fn']
+    return fn(historico, col15_raw)
+
+
+def _strat_tokenizacao(historico, col15_raw=None) -> dict:
+    """Estratégia 0 — classificação semântica dos tokens. NF = primeiro NUMBER
+    plausível (3–10 díg), bônus após KEYWORD/NF_MARKER; nome = tokens NAME."""
     classified = tokenize_historico(historico)
     if not classified and not col15_raw:
         return {'value': None, 'status': 'EMPTY', 'candidates': [], 'name': ''}
@@ -566,10 +575,125 @@ def _strip_edge_stopwords(tokens: list) -> list:
     return toks
 
 
-def extract_nf_from_historico(complemento, col15_raw=None) -> dict:
-    """Extrai NF do Complemento Histórico via tokenização + classificação semântica.
-    Wrapper sobre smart_extract pra manter compatibilidade da API."""
-    r = smart_extract(complemento, col15_raw=col15_raw)
+def _primeiro_numero(classified):
+    """Primeiro NUMBER plausível (3–10 dígitos) da lista classificada. (str|None, pos)."""
+    for i, (kind, _raw, val) in enumerate(classified):
+        if kind == 'NUMBER' and 3 <= len(val) <= 10:
+            return str(int(val)), i
+    return None, -1
+
+
+def _nf_dict(nf_value, name, col15_raw):
+    """Empacota o resultado de uma estratégia (com fallback de NF pela col 15)."""
+    candidates = [nf_value] if nf_value else []
+    status = 'CONFIDENT' if nf_value else 'NOT_FOUND'
+    if not nf_value:
+        c15 = normalize_nf(col15_raw)
+        if c15:
+            nf_value, status, candidates = c15, 'FROM_COL15', [c15]
+    return {'value': nf_value, 'status': status, 'candidates': candidates, 'name': (name or '').strip()}
+
+
+_CONECTORES_NOME = (' DE ', ' DA ', ' DO ', ' DOS ', ' DAS ')
+
+
+def _strat_apos_conector(historico, col15_raw=None) -> dict:
+    """Estratégia 1 — nome = tudo APÓS o 1º conector 'de/da/do' (ex: 'NFSE nr 3607
+    de CLINISEG SERVICOS...'). NF = 1º número antes do conector (ou o 1º número)."""
+    classified = tokenize_historico(historico)
+    if not classified and not col15_raw:
+        return {'value': None, 'status': 'EMPTY', 'candidates': [], 'name': ''}
+    nf_value, _ = _primeiro_numero(classified)
+    s = ' ' + _preprocess_historico(str(historico or '')) + ' '
+    s_norm = ' ' + _normalize_for_keyword(str(historico or '')) + ' '
+    pos = -1
+    for con in _CONECTORES_NOME:
+        p = s_norm.find(con)
+        if p != -1 and (pos == -1 or p < pos):
+            pos = p + len(con)
+    if pos != -1:
+        nome_raw = s[pos:]
+        toks = [t for t in re.findall(r'\S+', nome_raw)
+                if not re.fullmatch(r'[\d\W]+', t)]
+        toks = _strip_edge_stopwords([re.sub(r'^[^\w]+|[^\w]+$', '', t) for t in toks])
+        name = ' '.join(t for t in toks if t)
+    else:
+        name = ' '.join(_strip_edge_stopwords(
+            [v for k, _r, v in classified if k == 'NAME']))
+    return _nf_dict(nf_value, name, col15_raw)
+
+
+def _strat_antes_numero(historico, col15_raw=None) -> dict:
+    """Estratégia 2 — nome = texto ANTES do 1º número; NF = esse 1º número."""
+    classified = tokenize_historico(historico)
+    if not classified and not col15_raw:
+        return {'value': None, 'status': 'EMPTY', 'candidates': [], 'name': ''}
+    nf_value, pos = _primeiro_numero(classified)
+    antes = classified[:pos] if pos >= 0 else classified
+    toks = [v for k, _r, v in antes if k in ('NAME', 'NF_MARKER')]
+    name = ' '.join(_strip_edge_stopwords(toks))
+    if not name:  # nada antes do número → cai pros NAME gerais
+        name = ' '.join(_strip_edge_stopwords(
+            [v for k, _r, v in classified if k == 'NAME']))
+    return _nf_dict(nf_value, name, col15_raw)
+
+
+def _strat_maior_texto(historico, col15_raw=None) -> dict:
+    """Estratégia 3 — nome = TODOS os tokens de texto (qualquer posição); NF = o
+    número de mais dígitos (3–10)."""
+    classified = tokenize_historico(historico)
+    if not classified and not col15_raw:
+        return {'value': None, 'status': 'EMPTY', 'candidates': [], 'name': ''}
+    nums = [(str(int(v)), len(v)) for k, _r, v in classified
+            if k == 'NUMBER' and 3 <= len(v) <= 10]
+    nf_value = max(nums, key=lambda x: x[1])[0] if nums else None
+    name = ' '.join(_strip_edge_stopwords(
+        [v for k, _r, v in classified if k == 'NAME']))
+    return _nf_dict(nf_value, name, col15_raw)
+
+
+def _strat_col_nf(historico, col15_raw=None) -> dict:
+    """Estratégia 4 — NF vem da COLUNA própria do arquivo (col 15) quando existe;
+    nome = histórico limpo (remove só números/datas/CNPJ/marcadores fiscais)."""
+    classified = tokenize_historico(historico)
+    c15 = normalize_nf(col15_raw)
+    nf_first, _ = _primeiro_numero(classified)
+    nf_value = c15 or nf_first
+    name = ' '.join(_strip_edge_stopwords(
+        [v for k, _r, v in classified if k == 'NAME']))
+    status = 'FROM_COL15' if c15 else ('CONFIDENT' if nf_value else 'NOT_FOUND')
+    return {'value': nf_value, 'status': status,
+            'candidates': [nf_value] if nf_value else [], 'name': name.strip()}
+
+
+# Registro das estratégias de leitura do histórico (a tela cicla entre elas)
+EXTRACTION_STRATEGIES = [
+    {'key': 'tokenizacao', 'label': 'Tokenização inteligente (padrão)',
+     'descricao': 'Lê o histórico por significado: a NF é o número fiscal mais provável '
+                  'e a razão social é o trecho de texto (sem palavras fiscais).',
+     'fn': _strat_tokenizacao},
+    {'key': 'apos_conector', 'label': 'Nome depois de "de/da/do"',
+     'descricao': 'A razão social é o que vem DEPOIS do "de" (ex.: "NFSE nr 3607 de '
+                  'CLINISEG SERVICOS..." → nome = CLINISEG SERVICOS...).',
+     'fn': _strat_apos_conector},
+    {'key': 'antes_numero', 'label': 'Nome antes do número',
+     'descricao': 'A razão social é o texto que vem ANTES do número da nota '
+                  '(ex.: "CLINISEG SERVICOS LTDA 3607").',
+     'fn': _strat_antes_numero},
+    {'key': 'maior_texto', 'label': 'Nome = maior trecho de texto',
+     'descricao': 'Junta todo o texto do histórico como razão social (ignora a posição) '
+                  'e usa o número de mais dígitos como NF.',
+     'fn': _strat_maior_texto},
+    {'key': 'col_nf', 'label': 'NF da coluna do arquivo + nome limpo',
+     'descricao': 'Usa o número da coluna de NF da própria Razão e monta o nome com o '
+                  'texto restante do histórico.',
+     'fn': _strat_col_nf},
+]
+
+
+def extract_nf_from_historico(complemento, col15_raw=None, strategy=0) -> dict:
+    """Extrai NF do Complemento Histórico. Wrapper sobre smart_extract."""
+    r = smart_extract(complemento, col15_raw=col15_raw, strategy=strategy)
     return {
         'value': r['value'],
         'status': r['status'],
@@ -592,14 +716,47 @@ def extract_cnpj_from_historico(complemento) -> str | None:
     return None
 
 
-def extract_supplier_name(complemento) -> str:
-    """Extrai a Razão Social do Complemento Histórico via tokenização semântica.
+def extract_supplier_name(complemento, strategy=0) -> str:
+    """Extrai a Razão Social do Complemento Histórico (estratégia escolhida)."""
+    return smart_extract(complemento, strategy=strategy)['name']
 
-    Junta todos os tokens classificados como NAME (não-keywords, não-números,
-    não-CPF/CNPJ, não-datas). Funciona em qualquer formato de histórico
-    porque a classificação é por significado, não por regex de posição.
-    """
-    return smart_extract(complemento)['name']
+
+def preview_extracao(df_razao, strategy=0, limite=25) -> dict:
+    """Roda a extração (NF + Razão Social) numa AMOSTRA de linhas distintas da Razão
+    pra a usuária conferir o padrão ANTES de processar tudo. Devolve o rótulo da
+    estratégia + uma lista de exemplos {historico, nf, razao}."""
+    col_hist = 13  # Complemento Histórico (col 14, 0-indexed 13)
+    col_nf15 = 14  # NF original (col 15)
+    vistos = set()
+    amostras = []
+    for row in df_razao.itertuples(index=False):
+        hist = row[col_hist] if len(row) > col_hist else None
+        if hist is None or (isinstance(hist, float) and pd.isna(hist)):
+            continue
+        hist_s = str(hist).strip()
+        if not hist_s:
+            continue
+        chave = hist_s[:60].upper()
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+        col15 = row[col_nf15] if len(row) > col_nf15 else None
+        r = smart_extract(hist_s, col15_raw=col15, strategy=strategy)
+        amostras.append({
+            'historico': hist_s,
+            'nf': r['value'] or '—',
+            'razao': r['name'] or '—',
+        })
+        if len(amostras) >= limite:
+            break
+    meta = EXTRACTION_STRATEGIES[strategy % len(EXTRACTION_STRATEGIES)]
+    return {
+        'estrategia_idx': strategy % len(EXTRACTION_STRATEGIES),
+        'estrategia_label': meta['label'],
+        'estrategia_descricao': meta['descricao'],
+        'total_estrategias': len(EXTRACTION_STRATEGIES),
+        'amostras': amostras,
+    }
 
 
 def build_nf_only_index(agg_nf_map: dict) -> dict:
@@ -2108,8 +2265,16 @@ def _faixa_periodos(pers):
 # ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
+def preview_padrao(razao_stream, estrategia=0):
+    """Lê só a Razão e devolve uma amostra da extração (NF + Razão Social) pra a
+    usuária CONFERIR o padrão antes de processar tudo. Rápido — só lê a Razão."""
+    df_razao = _safe_read_excel(razao_stream, friendly_name='Razão Contábil',
+                                header=0, dtype=object)
+    return preview_extracao(df_razao, strategy=int(estrategia or 0))
+
+
 def processar_cruzamento(
-    razao_stream, c100efd_stream, a100_stream=None, f100_stream=None
+    razao_stream, c100efd_stream, a100_stream=None, f100_stream=None, estrategia=0
 ):
     """
     Entrypoint chamado pelo Flask.
@@ -2288,8 +2453,8 @@ def processar_cruzamento(
         vlr_partida_row = to_number(row[9]) if len(row) > 9 else 0  # col 10 Vlr Partida
 
         # NF: extração multi-padrão + fallback automático pra col 15
-        nf_ext = extract_nf_from_historico(complemento, col15_raw=col15)
-        supplier_name = extract_supplier_name(complemento)
+        nf_ext = extract_nf_from_historico(complemento, col15_raw=col15, strategy=estrategia)
+        supplier_name = extract_supplier_name(complemento, strategy=estrategia)
 
         # CNPJ — cascata GUIADA PELO NOME (estritamente consistente com o histórico):
         #   1. CNPJ direto no histórico (formatado ou 14 dígitos) — autoridade máxima
