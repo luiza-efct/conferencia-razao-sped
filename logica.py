@@ -2215,8 +2215,10 @@ def processar_cruzamento(
                     'receitas financeiras não serão validadas.')
 
     # ──────────────────────────────────────────────────────────────────────
-    # VALIDAÇÃO: CNPJ raiz da empresa precisa bater entre todos os 4 arquivos.
-    # Evita que o usuário importe acidentalmente um A100 de outra empresa.
+    # VALIDAÇÃO: a RAIZ do CNPJ (8 primeiros dígitos) precisa bater entre os
+    # arquivos. Filiais da MESMA empresa têm a mesma raiz e mudam só o sufixo
+    # de estabelecimento (/0001 matriz, /0005 filial, etc.) — isso é PERMITIDO,
+    # é a mesma empresa. Só bloqueia se a RAIZ divergir (outra empresa de fato).
     # ──────────────────────────────────────────────────────────────────────
     cnpjs_por_arquivo = {
         'Razão Contábil': razao_company_cnpj,
@@ -2226,29 +2228,38 @@ def processar_cruzamento(
     }
     log.info('CNPJs da empresa-raiz por arquivo: %s', cnpjs_por_arquivo)
     cnpjs_validos = {k: v for k, v in cnpjs_por_arquivo.items() if v}
-    cnpjs_distintos = set(cnpjs_validos.values())
-    if len(cnpjs_distintos) > 1:
-        # Identifica qual(is) divergem do CNPJ majoritário
-        majoritario = max(
-            set(cnpjs_validos.values()),
-            key=lambda c: list(cnpjs_validos.values()).count(c),
-        )
+    raizes = {k: v[:8] for k, v in cnpjs_validos.items()}  # raiz = 8 primeiros dígitos
+    raizes_distintas = set(raizes.values())
+    if len(raizes_distintas) > 1:
+        # Raízes diferentes = empresas DIFERENTES de verdade → bloqueia
+        majoritaria = max(raizes_distintas, key=lambda r: list(raizes.values()).count(r))
         divergentes = [
-            f'{nome}={format_cnpj(c)}'
-            for nome, c in cnpjs_validos.items() if c != majoritario
+            f'{nome}={format_cnpj(cnpjs_validos[nome])}'
+            for nome, r in raizes.items() if r != majoritaria
         ]
+        exemplo = next(c for n, c in cnpjs_validos.items() if raizes[n] == majoritaria)
         msg = (
-            f'⚠ CNPJ da empresa difere entre os arquivos. '
-            f'Esperado (majoritário): {format_cnpj(majoritario)}. '
+            f'⚠ Os arquivos parecem ser de EMPRESAS DIFERENTES (raiz do CNPJ diverge). '
+            f'Maioria: {format_cnpj(exemplo)} (raiz {majoritaria}). '
             f'Divergente(s): {" · ".join(divergentes)}. '
-            f'Confira se você não importou um SPED de outra empresa por engano.'
+            f'Confira se você não importou um SPED de outra empresa por engano. '
+            f'(Filiais da mesma empresa — mesma raiz, sufixo /0001, /0002… diferente — '
+            f'são aceitas normalmente.)'
         )
         raise ValueError(msg)
-    elif len(cnpjs_distintos) == 0:
+    elif len(raizes_distintas) == 0:
         log.warning('Nenhum CNPJ da empresa-raiz pôde ser identificado em nenhum arquivo.')
     else:
-        log.info('✓ CNPJ raiz validado em todos os arquivos: %s',
-                 format_cnpj(next(iter(cnpjs_distintos))))
+        estabelecimentos = set(cnpjs_validos.values())
+        if len(estabelecimentos) > 1:
+            # Mesma raiz, sufixos diferentes = matriz + filiais da MESMA empresa → ok
+            log.info('✓ Mesma empresa (raiz %s) com %s estabelecimentos (matriz/filiais): %s — '
+                     'cruzamento liberado.',
+                     next(iter(raizes_distintas)), len(estabelecimentos),
+                     ', '.join(format_cnpj(c) for c in sorted(estabelecimentos)))
+        else:
+            log.info('✓ CNPJ raiz validado em todos os arquivos: %s',
+                     format_cnpj(next(iter(estabelecimentos))))
 
     # Índices NF-only pros blocos com NF — usados como último fallback pra inferir CNPJ
     # quando a Razão não fornece pistas suficientes (sem CNPJ direto, sem nome no histórico, etc).
