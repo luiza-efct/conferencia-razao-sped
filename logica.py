@@ -367,8 +367,8 @@ FISCAL_KEYWORDS = {
     'COMPRA', 'AQUISICAO', 'DEVOLUCAO', 'PRESTACAO',
     'VLRREF', 'VLRREFNF',
     'TOTAL', 'PARCELA', 'PARC',
-    'CONFORME', 'CONF',
-    'DESPESA', 'LANCAMENTO',
+    'CONFORME', 'CONF', 'CFE', 'CF',  # "conforme" abreviado
+    'DESPESA', 'DESPESAS', 'LANCAMENTO', 'AVISO', 'AVS',  # prefixos de descrição
     'LR',  # "Lançamento Razão" — prefixo comum
     'APROP', 'APROPRIACAO',  # "Apropriação"
     'ORIGINAL', 'OMISSO', 'OMISSA',  # marcadores de status do lançamento
@@ -385,6 +385,19 @@ NF_MARKERS_SINGLE = {'N', 'F', 'NF', 'NFE'}
 # Preposições/conectores que NUNCA iniciam uma razão social. São removidos só
 # das PONTAS do nome extraído (no meio permanecem: "SERVICOS DE APOIO").
 NAME_EDGE_STOPWORDS = {'DE', 'DA', 'DO', 'DOS', 'DAS', 'E', 'EM', 'A', 'O'}
+
+# Palavras que indicam o INÍCIO de uma razão social por tipo de entidade.
+# Usadas na estratégia "nome a partir do tipo de empresa" (ex: a razão começa em
+# "FUNDO DE INVESTIMENTO...", "BANCO...", "CONDOMINIO...", "ASSOCIACAO...").
+ANCORA_EMPRESA = {
+    'FUNDO', 'BANCO', 'COMPANHIA', 'CIA', 'COOPERATIVA', 'COOP', 'ASSOCIACAO',
+    'INSTITUTO', 'FUNDACAO', 'CONDOMINIO', 'SINDICATO', 'IGREJA', 'PAROQUIA',
+    'MUNICIPIO', 'PREFEITURA', 'ESTADO', 'CARTORIO', 'CAIXA', 'CLINICA',
+    'HOSPITAL', 'ESCOLA', 'COLEGIO', 'UNIVERSIDADE', 'FACULDADE', 'CENTRO',
+    'SOCIEDADE', 'EMPRESA', 'AUTO', 'POSTO', 'SUPERMERCADO', 'MERCADO',
+    'COMERCIAL', 'INDUSTRIA', 'INDUSTRIAL', 'TRANSPORTES', 'TRANSPORTADORA',
+    'CONSTRUTORA', 'IMOBILIARIA', 'DISTRIBUIDORA', 'ATACADO', 'ATACADAO',
+}
 
 
 def _normalize_for_keyword(s: str) -> str:
@@ -666,6 +679,56 @@ def _strat_col_nf(historico, col15_raw=None) -> dict:
             'candidates': [nf_value] if nf_value else [], 'name': name.strip()}
 
 
+def _strat_ancora_empresa(historico, col15_raw=None) -> dict:
+    """Estratégia 5 — a razão social começa no TIPO de entidade (FUNDO, BANCO,
+    CONDOMINIO, ASSOCIACAO, COOPERATIVA, INDUSTRIA, COMERCIAL…) e vai até o fim.
+    Ideal pra históricos com prefixo de descrição: 'DESPESAS CFE AVISO 5359-D
+    FUNDO DE INVESTIMENTO...' → nome = 'FUNDO DE INVESTIMENTO...'."""
+    classified = tokenize_historico(historico)
+    if not classified and not col15_raw:
+        return {'value': None, 'status': 'EMPTY', 'candidates': [], 'name': ''}
+    nf_value, _ = _primeiro_numero(classified)
+    start = None
+    for i, (k, _r, v) in enumerate(classified):
+        if k == 'NAME' and _normalize_for_keyword(v) in ANCORA_EMPRESA:
+            start = i
+            break
+    if start is not None:
+        toks = [v for k, _r, v in classified[start:] if k == 'NAME']
+    else:
+        toks = [v for k, _r, v in classified if k == 'NAME']
+    name = ' '.join(_strip_edge_stopwords(toks))
+    return _nf_dict(nf_value, name, col15_raw)
+
+
+def _strat_apos_ultimo_numero(historico, col15_raw=None) -> dict:
+    """Estratégia 6 — a razão social é o texto DEPOIS do último número/código de
+    documento (ex: '...AVISO 5359-D FUNDO DE INVESTIMENTO...' → 'FUNDO DE
+    INVESTIMENTO...'). Bom quando o nome vem no FIM, após dados do documento."""
+    s = _preprocess_historico(str(historico or ''))
+    raw = re.findall(r'\S+', s)
+    last_digit = -1
+    for i, t in enumerate(raw):
+        if any(ch.isdigit() for ch in t):
+            last_digit = i
+    resto = raw[last_digit + 1:] if last_digit >= 0 else raw
+    toks = []
+    for t in resto:
+        bare = re.sub(r'^[^\w]+|[^\w]+$', '', t)
+        if not bare or bare.isdigit():
+            continue
+        un = _normalize_for_keyword(bare)
+        if un in FISCAL_KEYWORDS or un in NF_MARKERS_SINGLE:
+            continue
+        toks.append(bare)
+    name = ' '.join(_strip_edge_stopwords(toks))
+    if not name:  # nada depois do número → cai pros NAME gerais
+        classified = tokenize_historico(historico)
+        name = ' '.join(_strip_edge_stopwords([v for k, _r, v in classified if k == 'NAME']))
+    nf_value, _ = _primeiro_numero(tokenize_historico(historico))
+    return _nf_dict(nf_value, name, col15_raw)
+
+
 # Registro das estratégias de leitura do histórico (a tela cicla entre elas)
 EXTRACTION_STRATEGIES = [
     {'key': 'tokenizacao', 'label': 'Tokenização inteligente (padrão)',
@@ -688,6 +751,15 @@ EXTRACTION_STRATEGIES = [
      'descricao': 'Usa o número da coluna de NF da própria Razão e monta o nome com o '
                   'texto restante do histórico.',
      'fn': _strat_col_nf},
+    {'key': 'ancora_empresa', 'label': 'Nome a partir do tipo de empresa',
+     'descricao': 'A razão social começa no tipo da entidade (FUNDO, BANCO, CONDOMÍNIO, '
+                  'ASSOCIAÇÃO, INDÚSTRIA, COMERCIAL…) e vai até o fim. Ex.: "DESPESAS CFE '
+                  'AVISO 5359-D FUNDO DE INVESTIMENTO..." → "FUNDO DE INVESTIMENTO...".',
+     'fn': _strat_ancora_empresa},
+    {'key': 'apos_ultimo_numero', 'label': 'Nome depois do último número/código',
+     'descricao': 'A razão social é o texto que vem DEPOIS do último número ou código de '
+                  'documento do histórico (quando o nome vem no fim do texto).',
+     'fn': _strat_apos_ultimo_numero},
 ]
 
 
