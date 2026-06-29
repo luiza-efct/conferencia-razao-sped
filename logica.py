@@ -1528,17 +1528,11 @@ def _detect_columns_by_name(headers: list, patterns: dict) -> dict:
 
 def read_sped(file_stream, schema, friendly_name='SPED'):
     """
-    Lê um SPED detectando colunas pelo NOME do cabeçalho (não posição fixa).
-    Funciona com qualquer layout de exportador SPED.
-
-    Retorna (df_logico, col_map):
-      • df_logico — DataFrame só com as COLUNAS LÓGICAS renomeadas (cnpj, nf, valor,
-        cst, periodo, vlr_operacao, cnpj_empresa). Pouca memória mesmo em arquivos
-        gigantes — o bloco COMPLETO é lido depois em streaming (openpyxl read_only),
-        sem nunca segurar as 84 colunas × dezenas de milhares de linhas na RAM.
-      • col_map — dict campo_lógico → índice 0-based da coluna no arquivo original.
+    Detecta as colunas de um SPED pelo NOME do cabeçalho (não posição fixa) e
+    valida que os campos essenciais existem. Retorna col_map (campo lógico →
+    índice 0-based da coluna no arquivo). NÃO lê os dados — a agregação é feita
+    em streaming (openpyxl read_only), muito mais rápido que o pandas.
     """
-    # 1) Lê só o cabeçalho pra detectar posições reais das colunas
     header_df = _safe_read_excel(
         file_stream, friendly_name=friendly_name, header=0, nrows=0, dtype=object
     )
@@ -1549,7 +1543,6 @@ def read_sped(file_stream, schema, friendly_name='SPED'):
     log.info('SPED "%s" (%s cols) — colunas detectadas: %s',
              friendly_name, len(headers), {k: f'{v+1} ({headers[v]})' for k, v in col_map.items()})
 
-    # 2) Valida que campos essenciais foram encontrados
     required = schema.get('required_fields', list(patterns.keys()))
     missing = [f for f in required if f not in col_map]
     if missing:
@@ -1557,52 +1550,44 @@ def read_sped(file_stream, schema, friendly_name='SPED'):
             f'Não consegui localizar as colunas {missing} em "{friendly_name}". '
             f'Cabeçalhos disponíveis: {", ".join(str(h) for h in headers[:20])}...'
         )
-
-    # 3) Lê SÓ as colunas lógicas (memória baixa) e renomeia pros nomes lógicos
-    cols_to_read = sorted(set(col_map.values()))
-    df = _safe_read_excel(
-        file_stream, friendly_name=friendly_name, header=0,
-        usecols=cols_to_read, dtype=object,
-    )
-    rename_map = {}
-    for field, real_idx in col_map.items():
-        actual_pos = cols_to_read.index(real_idx)
-        rename_map[df.columns[actual_pos]] = field
-    df = df.rename(columns=rename_map)
-    return df, col_map
+    return col_map
 
 
 def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'):
     """
-    Lê + agrega um SPED em um passo só, populando o mapa Nome→CNPJ.
+    Agrega um SPED lendo o arquivo em STREAMING (openpyxl read_only) — sem pandas
+    e sem segurar o arquivo na RAM. Muito mais rápido em arquivos largos (84 colunas
+    × dezenas de milhares de linhas) e popula o mapa Nome→CNPJ.
 
-    Para A100/F100 (apply_cst=True) construímos DOIS aggregates:
-      • agg          → CST 50-67 (com crédito — alvo principal do cruzamento)
-      • agg_no_cred  → CST FORA de 50-67 (sem crédito — informativo)
-    Pra C100-EFD (apply_cst=False), só `agg` (sem distinção de CST).
-
-    Retorna dict com 'agg', 'agg_no_cred', 'skipped', 'total', 'cnpj_added', 'company_cnpj'.
+    Para A100/F100 (apply_cst=True): agg (CST 50-67, com crédito) + agg_no_cred (resto).
+    Pra C100-EFD (apply_cst=False): só agg.
     """
-    df, col_map = read_sped(file_stream, schema, friendly_name=friendly_name)
+    from openpyxl import load_workbook as _load_ro
+    col_map = read_sped(file_stream, schema, friendly_name=friendly_name)
     apply_cst = schema['apply_cst']
     kind = schema['kind']
 
     agg_map = {}
     agg_no_cred = {} if apply_cst else None
-    skipped = 0  # linhas que foram pro aggregate sem crédito
+    skipped = 0
     cnpj_added = 0
     company_cnpj_count = {}
-    periodos = set()  # períodos (MM/AAAA) presentes no bloco — pra alerta de cobertura
-    has_periodo = 'periodo' in df.columns
+    periodos = set()
+
+    i_ce = col_map.get('cnpj_empresa'); i_cnpj = col_map.get('cnpj')
+    i_nome = col_map.get('nome'); i_nf = col_map.get('nf'); i_val = col_map.get('valor')
+    i_cst = col_map.get('cst'); i_per = col_map.get('periodo'); i_op = col_map.get('vlr_operacao')
+
+    def g(vals, idx):
+        return vals[idx] if (idx is not None and idx < len(vals)) else None
 
     def _push_nf(target, nf_n, cnpj_val, value):
-        key = f'{nf_n}|{cnpj_val}'
-        entry = target.get(key)
+        entry = target.get(f'{nf_n}|{cnpj_val}')
         if entry:
             entry['total'] += value
             entry['items'] += 1
         else:
-            target[key] = {'total': value, 'items': 1}
+            target[f'{nf_n}|{cnpj_val}'] = {'total': value, 'items': 1}
 
     def _push_f100(target, cnpj_val, per, op, bc):
         key = f'{cnpj_val}|{per}'
@@ -1611,48 +1596,50 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
         else:
             target[key].append({'op': op, 'bc': bc})
 
-    for row in df.itertuples(index=False):
-        # Rastreia CNPJ da empresa-raiz (col 1 = cnpj_empresa)
-        ce_raw = getattr(row, 'cnpj_empresa', None)
+    if hasattr(file_stream, 'seek'):
+        file_stream.seek(0)
+    wb_in = _load_ro(file_stream, read_only=True, data_only=True)
+    src = wb_in.active
+    rows = src.iter_rows(values_only=True)
+    next(rows, None)  # pula cabeçalho
+    total = 0
+    for vals in rows:
+        total += 1
+        ce_raw = g(vals, i_ce)
         if ce_raw is not None:
             ce_norm = normalize_cnpj(ce_raw)
             if len(ce_norm) == 14:
                 company_cnpj_count[ce_norm] = company_cnpj_count.get(ce_norm, 0) + 1
-
-        # Coleta o período da linha (pra checar cobertura Razão × bloco depois)
-        if has_periodo:
-            _per = to_month_year(getattr(row, 'periodo', None))
+        if i_per is not None:
+            _per = to_month_year(g(vals, i_per))
             if _per:
                 periodos.add(_per)
 
-        # Decide pra qual aggregate vai a linha
-        has_credit = True if not apply_cst else is_credit_cst(row.cst)
+        has_credit = True if not apply_cst else is_credit_cst(g(vals, i_cst))
         target = agg_map if has_credit else agg_no_cred
         if not has_credit:
             skipped += 1
         if target is None:
             continue
 
-        # Build Nome→CNPJ map sempre (independente de ter crédito)
-        name_key = normalize_name(row.nome)
-        cnpj_val = normalize_cnpj(row.cnpj)
+        name_key = normalize_name(g(vals, i_nome))
+        cnpj_val = normalize_cnpj(g(vals, i_cnpj))
         if name_key and len(cnpj_val) == 14 and name_key not in cnpj_map:
             cnpj_map[name_key] = cnpj_val
             cnpj_added += 1
 
         if kind == 'nf':
-            nf_n = normalize_nf(row.nf)
+            nf_n = normalize_nf(g(vals, i_nf))
             if not nf_n or not cnpj_val:
                 continue
-            _push_nf(target, nf_n, cnpj_val, to_number(row.valor))
+            _push_nf(target, nf_n, cnpj_val, to_number(g(vals, i_val)))
         elif kind == 'f100':
-            per = to_month_year(row.periodo)
+            per = to_month_year(g(vals, i_per))
             if not cnpj_val or not per:
                 continue
-            _push_f100(target, cnpj_val, per,
-                       to_number(row.vlr_operacao), to_number(row.valor))
+            _push_f100(target, cnpj_val, per, to_number(g(vals, i_op)), to_number(g(vals, i_val)))
+    wb_in.close()
 
-    total = len(df)
     company_cnpj = (
         max(company_cnpj_count.items(), key=lambda x: x[1])[0]
         if company_cnpj_count else None
