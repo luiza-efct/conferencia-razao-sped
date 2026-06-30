@@ -2508,8 +2508,24 @@ def processar_cruzamento(
 
     cnpj_map: dict[str, str] = {}
 
+    # Lê os bytes de cada SPED UMA vez. Cada leitura (agregação e, depois, escrita da
+    # aba do bloco) recebe uma cópia NOVA (BytesIO) — nunca reaproveita o mesmo stream,
+    # senão a 2ª leitura via openpyxl vinha vazia (bug das abas de bloco em branco).
+    def _bytes_de(stream):
+        if stream is None:
+            return None
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+        return stream.read()
+
+    efd_bytes = _bytes_de(c100efd_stream)
+    a100_bytes = _bytes_de(a100_stream)
+    f100_bytes = _bytes_de(f100_stream)
+
     log.info('Processando C100-EFD FISCAL…')
-    r_efd = process_sped_block(c100efd_stream, SPED_SCHEMA['c100efd'], cnpj_map,
+    r_efd = process_sped_block(io.BytesIO(efd_bytes), SPED_SCHEMA['c100efd'], cnpj_map,
                                friendly_name='C100-EFD FISCAL')
     agg_efd_raw = r_efd['agg']
     efd_company_cnpj = r_efd['company_cnpj']
@@ -2517,9 +2533,9 @@ def processar_cruzamento(
     periodos_efd = r_efd['periodos']
     log.info('C100-EFD: %s linhas · %s chaves agregadas', r_efd['total'], len(agg_efd_raw))
 
-    if a100_stream is not None:
+    if a100_bytes is not None:
         log.info('Processando A100-CONTRI…')
-        r_a100 = process_sped_block(a100_stream, SPED_SCHEMA['a100'], cnpj_map,
+        r_a100 = process_sped_block(io.BytesIO(a100_bytes), SPED_SCHEMA['a100'], cnpj_map,
                                     friendly_name='A100-CONTRI')
         agg_a100_raw = r_a100['agg']
         agg_a100_nc = r_a100['agg_no_cred'] or {}
@@ -2536,9 +2552,9 @@ def processar_cruzamento(
         col_a100 = {}
         periodos_a100 = set()
 
-    if f100_stream is not None:
+    if f100_bytes is not None:
         log.info('Processando F100-CONTRI…')
-        r_f100 = process_sped_block(f100_stream, SPED_SCHEMA['f100'], cnpj_map,
+        r_f100 = process_sped_block(io.BytesIO(f100_bytes), SPED_SCHEMA['f100'], cnpj_map,
                                     friendly_name='F100-CONTRI')
         agg_f100_raw = r_f100['agg']
         agg_f100_nc = r_f100['agg_no_cred'] or {}
@@ -2782,9 +2798,9 @@ def processar_cruzamento(
         razao_partidas_sum, razao_partidas_count,
         agg_a100_nc=agg_a100_nc, agg_f100_nc=agg_f100_nc,
         nf_idx_efd=nf_idx_list[0],
-        efd_stream=c100efd_stream, col_efd=col_efd,
-        a100_stream=a100_stream, col_a100=col_a100,
-        f100_stream=f100_stream, col_f100=col_f100,
+        efd_stream=io.BytesIO(efd_bytes), col_efd=col_efd,
+        a100_stream=io.BytesIO(a100_bytes) if a100_bytes is not None else None, col_a100=col_a100,
+        f100_stream=io.BytesIO(f100_bytes) if f100_bytes is not None else None, col_f100=col_f100,
     )
     stats['cnaes_buscados'] = len(cnae_results)
 
