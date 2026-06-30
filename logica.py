@@ -1526,6 +1526,23 @@ def _detect_columns_by_name(headers: list, patterns: dict) -> dict:
     return mapping
 
 
+def _sheet_para_leitura(wb_in, friendly_name='SPED'):
+    """Devolve a 1ª aba POR POSIÇÃO (igual ao pandas sheet 0, com que as colunas
+    foram detectadas) de um workbook read_only, com reset_dimensions() pra ignorar
+    a tag <dimension> errada que alguns exportadores de SPED gravam. Loga a estrutura
+    de abas pra diagnóstico (a 'ativa' às vezes não é a de dados)."""
+    sheets = wb_in.worksheets or [wb_in.active]
+    src = sheets[0]
+    try:
+        src.reset_dimensions()
+    except Exception:
+        pass
+    ativa = getattr(wb_in.active, 'title', '?')
+    log.info('read_only "%s": %s aba(s) %s · ativa="%s" · usando 1ª="%s"',
+             friendly_name, len(sheets), [s.title for s in sheets][:6], ativa, src.title)
+    return src
+
+
 def read_sped(file_stream, schema, friendly_name='SPED'):
     """
     Detecta as colunas de um SPED pelo NOME do cabeçalho (não posição fixa) e
@@ -1599,7 +1616,7 @@ def process_sped_block(file_stream, schema, cnpj_map: dict, friendly_name='SPED'
     if hasattr(file_stream, 'seek'):
         file_stream.seek(0)
     wb_in = _load_ro(file_stream, read_only=True, data_only=True)
-    src = wb_in.active
+    src = _sheet_para_leitura(wb_in)
     rows = src.iter_rows(values_only=True)
     next(rows, None)  # pula cabeçalho
     total = 0
@@ -2366,7 +2383,7 @@ def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind):
     if hasattr(file_stream, 'seek'):
         file_stream.seek(0)
     wb_in = _load_ro(file_stream, read_only=True, data_only=True)
-    src = wb_in.active
+    src = _sheet_para_leitura(wb_in)
     rows_iter = src.iter_rows(values_only=True)
     try:
         header_row = next(rows_iter)
