@@ -861,33 +861,101 @@ def _extract_aprendida(historico, col15_raw, regra) -> dict:
     return _nf_dict(nf_value, name, col15_raw)
 
 
-def montar_extrator(estrategia=0, exemplo_historico=None, exemplo_razao=None):
-    """Decide COMO extrair e devolve (extrator_fn, info). Se houver exemplo:
-    1) procura uma das leituras prontas que reproduz o exemplo; senão
-    2) deriva uma regra própria do exemplo. Sem exemplo, usa a `estrategia`."""
-    if exemplo_historico and exemplo_razao and str(exemplo_razao).strip():
-        alvo = ''.join(re.findall(r'[A-Z0-9]+', _normalize_for_keyword(str(exemplo_razao))))
-        # 1) alguma leitura pronta reproduz o exemplo?
-        for i, s in enumerate(EXTRACTION_STRATEGIES):
-            got = s['fn'](exemplo_historico, None).get('name', '')
-            if alvo and ''.join(re.findall(r'[A-Z0-9]+', _normalize_for_keyword(got))) == alvo:
-                fn = s['fn']
-                return ((lambda h, c: fn(h, c)),
-                        {'idx': i, 'label': f'Aprendido do seu exemplo · leitura "{s["label"]}"',
-                         'descricao': f'Seu exemplo casou com a leitura "{s["label"]}". '
-                                      f'Aplicando esse padrão em toda a base.'})
-        # 2) deriva regra própria
-        regra = _aprender_regra(exemplo_historico, exemplo_razao)
-        if regra:
-            return ((lambda h, c: _extract_aprendida(h, c, regra)),
-                    {'idx': -1, 'label': 'Aprendido do seu exemplo · regra própria',
-                     'descricao': _descreve_regra(regra)})
-        # 3) exemplo não pôde ser aprendido → segue com a estratégia escolhida
+def _canon(x):
+    """Canoniza um texto pra comparação (só letras/números, sem acento)."""
+    return ''.join(re.findall(r'[A-Z0-9]+', _normalize_for_keyword(str(x or ''))))
+
+
+def _aprender_regra_nf(historico_ex, nf_ex):
+    """Deriva de ONDE tirar a NF a partir do exemplo (histórico + NF correta).
+    Descobre qual número do histórico é a NF e o que vem antes dele (marcador),
+    pra reaplicar. Se a NF não estiver no histórico, assume que vem da coluna de NF."""
+    alvo = normalize_nf(nf_ex)
+    if not alvo:
+        return None
+    classified = tokenize_historico(historico_ex)
+    numeros = [(i, v) for i, (k, _r, v) in enumerate(classified) if k == 'NUMBER']
+    for pos, (i, v) in enumerate(numeros):
+        if str(int(v)) == alvo:
+            antes = _normalize_for_keyword(classified[i - 1][2]) if i > 0 else None
+            return {'kind': 'pos', 'idx': pos, 'before': antes}
+    return {'kind': 'col15'}  # não achou no histórico → é o número da coluna de NF
+
+
+def _extract_nf_aprendida(historico, col15_raw, regra_nf):
+    """Aplica a regra de NF aprendida do exemplo a um histórico qualquer."""
+    if not regra_nf or regra_nf.get('kind') == 'col15':
+        return normalize_nf(col15_raw)
+    classified = tokenize_historico(historico)
+    numeros = [(i, v) for i, (k, _r, v) in enumerate(classified) if k == 'NUMBER']
+    if not numeros:
+        return normalize_nf(col15_raw)
+    before = regra_nf.get('before')
+    if before:  # nº precedido pela mesma palavra do exemplo (ex: depois de "nr"/"aviso")
+        for i, v in numeros:
+            if i > 0 and _normalize_for_keyword(classified[i - 1][2]) == before:
+                return str(int(v))
+    idx = regra_nf.get('idx', 0)
+    if 0 <= idx < len(numeros):
+        return str(int(numeros[idx][1]))
+    return str(int(numeros[0][1]))
+
+
+def montar_extrator(estrategia=0, exemplo_historico=None, exemplo_razao=None, exemplo_nf=None):
+    """Decide COMO extrair (nome e NF) e devolve (extrator_fn, info).
+
+    Aprende com exemplo de forma INDEPENDENTE pra nome e NF:
+      • NOME: se você deu a razão certa, procura uma leitura pronta que a reproduz;
+        senão deriva uma regra própria (delimitador). Sem exemplo, usa a `estrategia`.
+      • NF: se você deu o número certo, aprende de onde tirá-lo (posição/marcador).
+    Assim dá pra corrigir SÓ o nome, SÓ a NF, ou os dois.
+    """
+    tem_razao = bool(exemplo_historico and str(exemplo_razao or '').strip())
+    tem_nf = bool(exemplo_historico and str(exemplo_nf or '').strip())
+    partes = []
+
+    # ---- método do NOME ----
+    nome_fn = None
+    if tem_razao:
+        alvo = _canon(exemplo_razao)
+        for s in EXTRACTION_STRATEGIES:
+            if alvo and _canon(s['fn'](exemplo_historico, None).get('name', '')) == alvo:
+                _f = s['fn']
+                nome_fn = (lambda h, c, _f=_f: _f(h, c))
+                partes.append(f'nome pela leitura "{s["label"]}"')
+                break
+        if nome_fn is None:
+            regra = _aprender_regra(exemplo_historico, exemplo_razao)
+            if regra:
+                nome_fn = (lambda h, c, _r=regra: _extract_aprendida(h, c, _r))
+                partes.append('nome por regra própria')
+    if nome_fn is None:
+        _base = EXTRACTION_STRATEGIES[estrategia % len(EXTRACTION_STRATEGIES)]['fn']
+        nome_fn = (lambda h, c, _f=_base: _f(h, c))
+
+    # ---- regra da NF ----
+    regra_nf = _aprender_regra_nf(exemplo_historico, exemplo_nf) if tem_nf else None
+    if regra_nf:
+        partes.append('NF pelo seu exemplo')
+
+    def extrator(h, c):
+        base = nome_fn(h, c)
+        if regra_nf:
+            nf = _extract_nf_aprendida(h, c, regra_nf)
+            if nf:
+                base = dict(base)
+                base['value'] = nf
+                base['status'] = 'CONFIDENT'
+                base['candidates'] = [nf]
+        return base
+
+    if partes:
+        return (extrator, {'idx': -1,
+                           'label': 'Aprendido do seu exemplo (' + ' + '.join(partes) + ')',
+                           'descricao': 'Aplicando o padrão que você ensinou em toda a base.'})
     s = EXTRACTION_STRATEGIES[estrategia % len(EXTRACTION_STRATEGIES)]
-    fn = s['fn']
-    return ((lambda h, c: fn(h, c)),
-            {'idx': estrategia % len(EXTRACTION_STRATEGIES),
-             'label': s['label'], 'descricao': s['descricao']})
+    return (extrator, {'idx': estrategia % len(EXTRACTION_STRATEGIES),
+                       'label': s['label'], 'descricao': s['descricao']})
 
 
 def extract_nf_from_historico(complemento, col15_raw=None, strategy=0) -> dict:
@@ -921,13 +989,13 @@ def extract_supplier_name(complemento, strategy=0) -> str:
 
 
 def preview_extracao(df_razao, strategy=0, exemplo_historico=None, exemplo_razao=None,
-                     limite=25) -> dict:
+                     exemplo_nf=None, limite=25) -> dict:
     """Roda a extração (NF + Razão Social) numa AMOSTRA de linhas distintas da Razão
     pra a usuária conferir o padrão ANTES de processar tudo. Se houver exemplo, usa o
     padrão aprendido dele. Devolve o rótulo da leitura + exemplos {historico, nf, razao}."""
     col_hist = 13  # Complemento Histórico (col 14, 0-indexed 13)
     col_nf15 = 14  # NF original (col 15)
-    extrator, info = montar_extrator(strategy, exemplo_historico, exemplo_razao)
+    extrator, info = montar_extrator(strategy, exemplo_historico, exemplo_razao, exemplo_nf)
     vistos = set()
     amostras = []
     for row in df_razao.itertuples(index=False):
@@ -2473,18 +2541,20 @@ def _faixa_periodos(pers):
 # ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
-def preview_padrao(razao_stream, estrategia=0, exemplo_historico=None, exemplo_razao=None):
+def preview_padrao(razao_stream, estrategia=0, exemplo_historico=None, exemplo_razao=None,
+                   exemplo_nf=None):
     """Lê só a Razão e devolve uma amostra da extração (NF + Razão Social) pra a
     usuária CONFERIR o padrão antes de processar tudo. Rápido — só lê a Razão."""
     df_razao = _safe_read_excel(razao_stream, friendly_name='Razão Contábil',
                                 header=0, dtype=object)
     return preview_extracao(df_razao, strategy=int(estrategia or 0),
-                            exemplo_historico=exemplo_historico, exemplo_razao=exemplo_razao)
+                            exemplo_historico=exemplo_historico, exemplo_razao=exemplo_razao,
+                            exemplo_nf=exemplo_nf)
 
 
 def processar_cruzamento(
     razao_stream, c100efd_stream, a100_stream=None, f100_stream=None, estrategia=0,
-    exemplo_historico=None, exemplo_razao=None
+    exemplo_historico=None, exemplo_razao=None, exemplo_nf=None
 ):
     """
     Entrypoint chamado pelo Flask.
@@ -2671,7 +2741,7 @@ def processar_cruzamento(
     # Pré-processa Razão (extração de NF, lookup CNPJ) + agrega partidas por NF+CNPJ
     # Monta UMA vez o extrator (leitura escolhida OU padrão aprendido do exemplo) e
     # reaplica em todas as linhas.
-    extrator, info_extrator = montar_extrator(estrategia, exemplo_historico, exemplo_razao)
+    extrator, info_extrator = montar_extrator(estrategia, exemplo_historico, exemplo_razao, exemplo_nf)
     log.info('Extraindo NF e CNPJ da Razão… (leitura: %s)', info_extrator['label'])
     enriched_list = []
     unique_cnpjs = set()

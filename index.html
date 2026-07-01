@@ -587,8 +587,11 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
     <label>Cole um <b>Complemento Histórico</b> de exemplo:
       <input type="text" id="pcExHist" placeholder="ex: DESPESAS CFE AVISO 5359-D FUNDO DE INVESTIMENTO IMOBILIARIO INDUSTRIAL DO BRASIL">
     </label>
-    <label>Qual é a <b>Razão Social correta</b> dele?
+    <label>Qual é a <b>Razão Social correta</b> dele? <span style="font-weight:400;color:#8a8a8a">(deixe em branco se só a NF está errada)</span>
       <input type="text" id="pcExRazao" placeholder="ex: FUNDO DE INVESTIMENTO IMOBILIARIO INDUSTRIAL DO BRASIL">
+    </label>
+    <label>Qual é o <b>Número da NF correto</b> dele? <span style="font-weight:400;color:#8a8a8a">(deixe em branco se só o nome está errado)</span>
+      <input type="text" id="pcExNf" placeholder="ex: 5359">
     </label>
     <button id="btnPatternLearn" class="primary" type="button">📌 Aprender com meu exemplo e reler</button>
     <span class="pc-learn-hint">A ferramenta descobre o padrão a partir do seu exemplo e reaplica na base inteira.</span>
@@ -646,6 +649,7 @@ let CURRENT_STRATEGY = 0;        // leitura do histórico aprovada/em conferênc
 let TOTAL_STRATEGIES = 7;
 let EX_HIST = '';                // exemplo dado pela usuária (histórico)
 let EX_RAZAO = '';               // exemplo dado pela usuária (razão social correta)
+let EX_NF = '';                  // exemplo dado pela usuária (número da NF correto)
 
 // --------------- helpers de UI ---------------
 function $(s){ return document.querySelector(s); }
@@ -749,7 +753,11 @@ async function previewPattern(){
     const fd = new FormData();
     fd.append('razao', FILES.razao);
     fd.append('estrategia', String(CURRENT_STRATEGY));
-    if (EX_RAZAO){ fd.append('exemplo_historico', EX_HIST); fd.append('exemplo_razao', EX_RAZAO); }
+    if (EX_RAZAO || EX_NF){
+      fd.append('exemplo_historico', EX_HIST);
+      if (EX_RAZAO) fd.append('exemplo_razao', EX_RAZAO);
+      if (EX_NF) fd.append('exemplo_nf', EX_NF);
+    }
     const resp = await fetch('/api/preview', { method:'POST', body: fd });
     hideProgress();
     if (!resp.ok){
@@ -821,7 +829,11 @@ async function processAll(){
     if (FILES.a100) fd.append('a100', FILES.a100);
     if (FILES.f100) fd.append('f100', FILES.f100);
     fd.append('estrategia', String(CURRENT_STRATEGY));  // leitura do histórico aprovada
-    if (EX_RAZAO){ fd.append('exemplo_historico', EX_HIST); fd.append('exemplo_razao', EX_RAZAO); }
+    if (EX_RAZAO || EX_NF){
+      fd.append('exemplo_historico', EX_HIST);
+      if (EX_RAZAO) fd.append('exemplo_razao', EX_RAZAO);
+      if (EX_NF) fd.append('exemplo_nf', EX_NF);
+    }
     // Consulta CNPJ→Razão Social/CNAE é sempre obrigatória — sem opção de pular
 
     const resp = await fetch('/api/processar', { method: 'POST', body: fd });
@@ -960,9 +972,10 @@ function resetAll(){
   $('#results').hidden = true;
   $('#patternConfirm').hidden = true;
   CURRENT_STRATEGY = 0;
-  EX_HIST = ''; EX_RAZAO = '';
+  EX_HIST = ''; EX_RAZAO = ''; EX_NF = '';
   if ($('#pcExHist')) $('#pcExHist').value = '';
   if ($('#pcExRazao')) $('#pcExRazao').value = '';
+  if ($('#pcExNf')) $('#pcExNf').value = '';
   window.__resultBlob = null;
   refreshState();
 }
@@ -971,27 +984,31 @@ function resetAll(){
 document.addEventListener('DOMContentLoaded', () => {
   $$('.upload-card').forEach(attachUpload);
   // Etapa 1: o botão principal abre a conferência do padrão (não processa direto)
-  $('#btnProcess').addEventListener('click', () => { CURRENT_STRATEGY = 0; EX_HIST=''; EX_RAZAO=''; previewPattern(); });
+  $('#btnProcess').addEventListener('click', () => { CURRENT_STRATEGY = 0; EX_HIST=''; EX_RAZAO=''; EX_NF=''; previewPattern(); });
   // Etapa 2: aprovar o padrão → processa tudo com a leitura escolhida
   $('#btnPatternOk').addEventListener('click', processAll);
   // Repensar → próxima leitura PRONTA (cicla) e limpa o exemplo aplicado
   $('#btnPatternRethink').addEventListener('click', () => {
-    EX_HIST = ''; EX_RAZAO = '';
+    EX_HIST = ''; EX_RAZAO = ''; EX_NF = '';
     if ($('#pcExRazao')) $('#pcExRazao').value = '';
+    if ($('#pcExNf')) $('#pcExNf').value = '';
     CURRENT_STRATEGY = (CURRENT_STRATEGY + 1) % TOTAL_STRATEGIES;
     previewPattern();
   });
-  // Aprender com exemplo → usa o histórico + razão correta digitados
+  // Aprender com exemplo → usa o histórico + razão e/ou NF corretas digitadas
   $('#btnPatternLearn').addEventListener('click', () => {
     const h = ($('#pcExHist').value || '').trim();
     const r = ($('#pcExRazao').value || '').trim();
-    if (!r){
-      $('#pcExRazao').focus();
+    const nf = ($('#pcExNf').value || '').trim();
+    if (!r && !nf){  // precisa corrigir ao menos um (nome ou NF)
       $('#pcExRazao').style.borderColor = '#c0392b';
+      $('#pcExNf').style.borderColor = '#c0392b';
+      $('#pcExRazao').focus();
       return;
     }
     $('#pcExRazao').style.borderColor = '';
-    EX_HIST = h; EX_RAZAO = r;
+    $('#pcExNf').style.borderColor = '';
+    EX_HIST = h; EX_RAZAO = r; EX_NF = nf;
     previewPattern();
   });
   $('#btnPatternCancel').addEventListener('click', () => { $('#patternConfirm').hidden = true; });

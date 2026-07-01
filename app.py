@@ -58,8 +58,10 @@ def preview():
             estrategia = 0
         ex_hist = (request.form.get('exemplo_historico') or '').strip() or None
         ex_razao = (request.form.get('exemplo_razao') or '').strip() or None
+        ex_nf = (request.form.get('exemplo_nf') or '').strip() or None
         resultado = preview_padrao(razao.stream, estrategia=estrategia,
-                                   exemplo_historico=ex_hist, exemplo_razao=ex_razao)
+                                   exemplo_historico=ex_hist, exemplo_razao=ex_razao,
+                                   exemplo_nf=ex_nf)
         return jsonify(resultado)
     except ValueError as e:
         app.logger.warning('Preview falhou: %s', e)
@@ -108,6 +110,7 @@ def processar():
             estrategia = 0
         ex_hist = (request.form.get('exemplo_historico') or '').strip() or None
         ex_razao = (request.form.get('exemplo_razao') or '').strip() or None
+        ex_nf = (request.form.get('exemplo_nf') or '').strip() or None
 
         out_bytes, stats = processar_cruzamento(
             razao_stream=razao.stream,
@@ -117,6 +120,7 @@ def processar():
             estrategia=estrategia,
             exemplo_historico=ex_hist,
             exemplo_razao=ex_razao,
+            exemplo_nf=ex_nf,
         )
 
         # Nome do arquivo de saída derivado do nome da Razão
