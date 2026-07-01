@@ -35,6 +35,10 @@ log = logging.getLogger(__name__)
 # CONSTANTES
 # ============================================================
 TOLERANCIA_VALOR = 100.00
+# Até este nº de linhas, a aba de bloco traz o SPED INTEIRO. Acima disso (ex: C100
+# nível item com 500 mil linhas), traz só as linhas ligadas à Razão (senão a escrita
+# levaria dezenas de minutos e o Excel travaria).
+LIMITE_BLOCO_COMPLETO = 60000
 CNAE_CONCURRENCY = 3  # paralelismo conservador pra não bater rate limit
 CNAE_TIMEOUT = 12  # segundos por request HTTP
 USER_AGENT = 'Mozilla/5.0 EFCT-Hub/1.0'
@@ -1890,7 +1894,8 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
                    agg_a100_nc=None, agg_f100_nc=None,
                    nf_idx_efd=None,
                    efd_stream=None, a100_stream=None, f100_stream=None,
-                   col_efd=None, col_a100=None, col_f100=None):
+                   col_efd=None, col_a100=None, col_f100=None,
+                   efd_total=0, a100_total=0, f100_total=0):
     """Constrói o workbook com Razão cruzada + Pendências + 3 abas dos blocos SPED.
 
     `agg_a100_nc` e `agg_f100_nc` são aggregates de NFs SEM crédito (CST fora 50-67).
@@ -2326,13 +2331,13 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     # (sem segurar tudo na RAM) — cabe no plano free mesmo com arquivos gigantes.
     if efd_stream is not None:
         _write_bloco_full(wb, SHEET_EFD, efd_stream, col_efd or {}, styles, kind='efd',
-                          chaves_nf=razao_keys_nf, nfs=razao_nfs)
+                          chaves_nf=razao_keys_nf, nfs=razao_nfs, total_linhas=efd_total)
     if a100_stream is not None:
         _write_bloco_full(wb, SHEET_A100, a100_stream, col_a100 or {}, styles, kind='a100',
-                          chaves_nf=razao_keys_nf, nfs=razao_nfs)
+                          chaves_nf=razao_keys_nf, nfs=razao_nfs, total_linhas=a100_total)
     if f100_stream is not None:
         _write_bloco_full(wb, SHEET_F100, f100_stream, col_f100 or {}, styles, kind='f100',
-                          chaves_per=razao_keys_per)
+                          chaves_per=razao_keys_per, total_linhas=f100_total)
 
     return wb, stats
 
@@ -2362,14 +2367,15 @@ def _clean_cell(v):
 
 
 def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind,
-                      chaves_nf=None, nfs=None, chaves_per=None):
+                      chaves_nf=None, nfs=None, chaves_per=None, total_linhas=0):
     """Escreve a aba de bloco lendo o arquivo em STREAMING (openpyxl read_only) —
     nunca segura o bloco inteiro na RAM.
 
-    FILTRO: escreve só as linhas LIGADAS À RAZÃO (cuja chave CNPJ|NF ou CNPJ|Período,
-    ou a NF sozinha, aparece na Razão). Isso é essencial em C100 gigante (500 mil+
-    linhas): escrever tudo levaria dezenas de minutos. Se os filtros vierem None,
-    escreve tudo (compatibilidade).
+    INTELIGÊNCIA POR TAMANHO:
+      • bloco pequeno (≤ LIMITE_BLOCO_COMPLETO linhas) → traz o bloco INTEIRO;
+      • bloco grande (ex: C100 com 500 mil linhas item C170/C190) → traz só as linhas
+        LIGADAS À RAZÃO (chave CNPJ|NF / CNPJ|Período, ou a NF), senão escrever tudo
+        levaria dezenas de minutos e o Excel travaria pra abrir.
 
     Colunas-chave fixas no início (usadas pelas FÓRMULAS) + TODAS as colunas
     originais do arquivo importado (pra consulta/filtro):
@@ -2429,7 +2435,11 @@ def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind,
         hdr_cells.append(hc)
     ws.append(hdr_cells)
 
-    filtra = (chaves_nf is not None) or (chaves_per is not None)
+    # Decide pelo TAMANHO: bloco pequeno → inteiro; grande → só linhas da Razão
+    tem_filtro = (chaves_nf is not None) or (chaves_per is not None)
+    filtra = tem_filtro and (total_linhas > LIMITE_BLOCO_COMPLETO)
+    log.info('Bloco "%s": %s linhas → modo %s', sheet_name, total_linhas,
+             'FILTRADO (só ligadas à Razão)' if filtra else 'COMPLETO (bloco inteiro)')
     lidas = 0
     nrows = 0
     for vals in rows_iter:
@@ -2581,6 +2591,7 @@ def processar_cruzamento(
     efd_company_cnpj = r_efd['company_cnpj']
     col_efd = r_efd['col_map']
     periodos_efd = r_efd['periodos']
+    efd_total = r_efd['total']
     log.info('C100-EFD: %s linhas · %s chaves agregadas', r_efd['total'], len(agg_efd_raw))
 
     if a100_bytes is not None:
@@ -2592,6 +2603,7 @@ def processar_cruzamento(
         a100_company_cnpj = r_a100['company_cnpj']
         col_a100 = r_a100['col_map']
         periodos_a100 = r_a100['periodos']
+        a100_total = r_a100['total']
         log.info('A100: %s linhas · %s sem crédito (CST fora 50-67) · %s chaves com crédito · %s chaves sem crédito',
                  r_a100['total'], r_a100['skipped'], len(agg_a100_raw), len(agg_a100_nc))
     else:
@@ -2601,6 +2613,7 @@ def processar_cruzamento(
         a100_company_cnpj = None
         col_a100 = {}
         periodos_a100 = set()
+        a100_total = 0
 
     if f100_bytes is not None:
         log.info('Processando F100-CONTRI…')
@@ -2611,6 +2624,7 @@ def processar_cruzamento(
         f100_company_cnpj = r_f100['company_cnpj']
         col_f100 = r_f100['col_map']
         periodos_f100 = r_f100['periodos']
+        f100_total = r_f100['total']
         log.info('F100: %s linhas · %s sem crédito · %s chaves com crédito · %s chaves sem crédito',
                  r_f100['total'], r_f100['skipped'], len(agg_f100_raw), len(agg_f100_nc))
     else:
@@ -2620,6 +2634,7 @@ def processar_cruzamento(
         f100_company_cnpj = None
         col_f100 = {}
         periodos_f100 = set()
+        f100_total = 0
 
     log.info('Mapa CNPJ: %s fornecedores', len(cnpj_map))
     # Avisos proativos quando o mapa pode estar "pobre"
@@ -2848,9 +2863,9 @@ def processar_cruzamento(
         razao_partidas_sum, razao_partidas_count,
         agg_a100_nc=agg_a100_nc, agg_f100_nc=agg_f100_nc,
         nf_idx_efd=nf_idx_list[0],
-        efd_stream=io.BytesIO(efd_bytes), col_efd=col_efd,
-        a100_stream=io.BytesIO(a100_bytes) if a100_bytes is not None else None, col_a100=col_a100,
-        f100_stream=io.BytesIO(f100_bytes) if f100_bytes is not None else None, col_f100=col_f100,
+        efd_stream=io.BytesIO(efd_bytes), col_efd=col_efd, efd_total=efd_total,
+        a100_stream=io.BytesIO(a100_bytes) if a100_bytes is not None else None, col_a100=col_a100, a100_total=a100_total,
+        f100_stream=io.BytesIO(f100_bytes) if f100_bytes is not None else None, col_f100=col_f100, f100_total=f100_total,
     )
     stats['cnaes_buscados'] = len(cnae_results)
 
