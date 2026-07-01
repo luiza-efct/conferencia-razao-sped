@@ -1158,11 +1158,15 @@ def search_cnpj_by_name_web(supplier_name: str) -> dict | None:
         if len(candidates) >= 5:
             break
 
+    # IMPORTANTE: só cacheia resultado POSITIVO. "Não encontrado" NÃO é cacheado —
+    # senão um nome que falhou uma vez (por bloqueio/rate-limit) nunca mais seria
+    # tentado. Sem cache negativo, ele é re-tentado no próximo processamento.
     if not candidates:
-        NAME_CNPJ_WEB_CACHE[key] = None
+        log.info('Web search "%s": nenhum CNPJ candidato nas fontes.', supplier_name[:50])
         return None
 
     # Valida candidatos via BrasilAPI/CNPJa — só aceita se o nome bater
+    melhor_sim = 0.0
     for cnpj in candidates[:8]:
         data = fetch_cnae_once(cnpj)
         if not data or not data.get('razao_social'):
@@ -1170,6 +1174,7 @@ def search_cnpj_by_name_web(supplier_name: str) -> dict | None:
         # Reconcilia o nome OFICIAL (da Receita) com o nome buscado (do histórico).
         # Limiar alto: a web traz muito candidato parecido-mas-errado.
         sim = _names_reconcile(supplier_name, data['razao_social'])
+        melhor_sim = max(melhor_sim, sim)
         if sim >= 0.70:
             result = {
                 'cnpj': cnpj,
@@ -1181,7 +1186,8 @@ def search_cnpj_by_name_web(supplier_name: str) -> dict | None:
             log.info('Web search "%s" → %s (%s, sim=%.2f)',
                      supplier_name[:50], cnpj, data['razao_social'][:40], sim)
             return result
-    NAME_CNPJ_WEB_CACHE[key] = None
+    log.info('Web search "%s": %s candidato(s), mas nenhum fechou o nome (melhor sim=%.2f).',
+             supplier_name[:50], len(candidates), melhor_sim)
     return None
 
 
@@ -2738,6 +2744,11 @@ def processar_cruzamento(
             nomes_sem_cnpj.setdefault(nome, []).append(idx)
 
     if nomes_sem_cnpj:
+        # Zera os contadores de bloqueio de fonte a CADA processamento — senão, depois
+        # que um processamento marca as fontes como bloqueadas, os próximos abortavam
+        # a busca na hora (causa do "às vezes traz, às vezes não").
+        for _k in _SOURCE_FAILURES:
+            _SOURCE_FAILURES[_k] = 0
         log.info('5ª camada: buscando %s nomes únicos via web…', len(nomes_sem_cnpj))
         web_found = 0
         abortou = False
