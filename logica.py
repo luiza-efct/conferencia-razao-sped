@@ -1958,6 +1958,10 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
         'amb_resolved': 0,
     }
     pendencias = {}  # cnpj → {cnpj, nome, cnae1, cnae2, total, count}
+    # Chaves da Razão pra filtrar os blocos (só linhas ligadas à Razão vão pras abas)
+    razao_keys_nf = set()   # 'CNPJ_fmt|NF' (C100/A100)
+    razao_nfs = set()       # 'NF' (fallback NF-only do C100)
+    razao_keys_per = set()  # 'CNPJ_fmt|Período' (F100)
 
     # ----- Linhas de dados -----
     for i, (row_data, meta) in enumerate(zip(df_razao.itertuples(index=False), enriched_list), start=2):
@@ -2042,6 +2046,14 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
         # Triple Check
         vlr_partida = to_number(row_data[9]) if len(row_data) > 9 else 0  # col 10 Vlr Partida (0-indexed 9)
         periodo = to_month_year(row_data[1]) if len(row_data) > 1 else ''  # col 2 Período
+
+        # Registra as chaves desta linha pra filtrar os blocos (só linhas ligadas à Razão)
+        if nf_value:
+            razao_nfs.add(nf_value)
+            if cnpj:
+                razao_keys_nf.add(f'{format_cnpj(cnpj)}|{nf_value}')
+        if cnpj and periodo:
+            razao_keys_per.add(f'{format_cnpj(cnpj)}|{periodo}')
 
         # Soma de partidas da Razão para esta NF+CNPJ (pra detectar match por soma)
         partida_key = f'{nf_value}|{cnpj}' if (nf_value and cnpj) else None
@@ -2313,11 +2325,14 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     # de TODAS as colunas originais do arquivo, lidas direto do arquivo em streaming
     # (sem segurar tudo na RAM) — cabe no plano free mesmo com arquivos gigantes.
     if efd_stream is not None:
-        _write_bloco_full(wb, SHEET_EFD, efd_stream, col_efd or {}, styles, kind='efd')
+        _write_bloco_full(wb, SHEET_EFD, efd_stream, col_efd or {}, styles, kind='efd',
+                          chaves_nf=razao_keys_nf, nfs=razao_nfs)
     if a100_stream is not None:
-        _write_bloco_full(wb, SHEET_A100, a100_stream, col_a100 or {}, styles, kind='a100')
+        _write_bloco_full(wb, SHEET_A100, a100_stream, col_a100 or {}, styles, kind='a100',
+                          chaves_nf=razao_keys_nf, nfs=razao_nfs)
     if f100_stream is not None:
-        _write_bloco_full(wb, SHEET_F100, f100_stream, col_f100 or {}, styles, kind='f100')
+        _write_bloco_full(wb, SHEET_F100, f100_stream, col_f100 or {}, styles, kind='f100',
+                          chaves_per=razao_keys_per)
 
     return wb, stats
 
@@ -2346,10 +2361,15 @@ def _clean_cell(v):
     return v
 
 
-def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind):
-    """Escreve a aba de bloco COMPLETA lendo o arquivo em STREAMING (openpyxl
-    read_only) — nunca segura o bloco inteiro na RAM. Funciona com arquivos enormes
-    (dezenas de milhares de linhas × dezenas de colunas) no plano free.
+def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind,
+                      chaves_nf=None, nfs=None, chaves_per=None):
+    """Escreve a aba de bloco lendo o arquivo em STREAMING (openpyxl read_only) —
+    nunca segura o bloco inteiro na RAM.
+
+    FILTRO: escreve só as linhas LIGADAS À RAZÃO (cuja chave CNPJ|NF ou CNPJ|Período,
+    ou a NF sozinha, aparece na Razão). Isso é essencial em C100 gigante (500 mil+
+    linhas): escrever tudo levaria dezenas de minutos. Se os filtros vierem None,
+    escreve tudo (compatibilidade).
 
     Colunas-chave fixas no início (usadas pelas FÓRMULAS) + TODAS as colunas
     originais do arquivo importado (pra consulta/filtro):
@@ -2409,28 +2429,40 @@ def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind):
         hdr_cells.append(hc)
     ws.append(hdr_cells)
 
+    filtra = (chaves_nf is not None) or (chaves_per is not None)
+    lidas = 0
     nrows = 0
     for vals in rows_iter:
-        nrows += 1
+        lidas += 1
         cnpj_n = normalize_cnpj(g(vals, i_cnpj))
         cnpj_fmt = format_cnpj(cnpj_n) if len(cnpj_n) == 14 else ''
         valor = to_number(g(vals, i_val))
 
         if kind == 'efd':
             nf_n = normalize_nf(g(vals, i_nf))
-            key_vals = [f'{cnpj_fmt}|{nf_n}', valor, nf_n]
+            chave = f'{cnpj_fmt}|{nf_n}'
+            key_vals = [chave, valor, nf_n]
+            relevante = (not filtra) or (chave in (chaves_nf or ())) or (nf_n and nf_n in (nfs or ()))
         elif kind == 'a100':
             nf_n = normalize_nf(g(vals, i_nf))
             cst_i = _cst_to_int(g(vals, i_cst))
             cred = 1 if (cst_i is not None and 50 <= cst_i <= 67) else 0
-            key_vals = [f'{cnpj_fmt}|{nf_n}', valor, cred]
+            chave = f'{cnpj_fmt}|{nf_n}'
+            key_vals = [chave, valor, cred]
+            relevante = (not filtra) or (chave in (chaves_nf or ())) or (nf_n and nf_n in (nfs or ()))
         else:  # f100
             per = to_month_year(g(vals, i_per))
             cst_i = _cst_to_int(g(vals, i_cst))
             cred = 1 if (cst_i is not None and 50 <= cst_i <= 67) else 0
             vlr_op = to_number(g(vals, i_op))
-            key_vals = [f'{cnpj_fmt}|{per}', valor, cred, vlr_op]
+            chave = f'{cnpj_fmt}|{per}'
+            key_vals = [chave, valor, cred, vlr_op]
+            relevante = (not filtra) or (chave in (chaves_per or ()))
 
+        if not relevante:
+            continue  # linha do bloco não tem relação com a Razão → não vai pra aba
+
+        nrows += 1
         row_out = key_vals + [None] + [_clean_cell(v) for v in vals]
         cB = WriteOnlyCell(ws, value=row_out[val_col - 1]); cB.number_format = '#,##0.00'
         row_out[val_col - 1] = cB
@@ -2441,7 +2473,8 @@ def _write_bloco_full(wb, sheet_name, file_stream, col_map, styles, kind):
 
     wb_in.close()
     ws.auto_filter.ref = f'A1:{get_column_letter(len(full_header))}{max(nrows + 1, 1)}'
-    log.info('Aba "%s" (streaming): %s linhas × %s colunas', sheet_name, nrows, len(full_header))
+    log.info('Aba "%s" (streaming): %s linhas escritas (de %s lidas) × %s colunas',
+             sheet_name, nrows, lidas, len(full_header))
 
 
 def _ordena_periodos(pers):
