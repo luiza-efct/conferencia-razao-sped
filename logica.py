@@ -2275,55 +2275,13 @@ def build_workbook(df_razao, enriched_list, agg_efd, agg_a100, agg_f100, cnae_re
     ws.auto_filter.ref = f'A1:{get_column_letter(TOTAL_COLS)}{stats["linhas_razao"] + 1}'
     ws.done()  # flush da última linha bufferizada
 
-    # ----- Aba PENDÊNCIAS DE CRUZAMENTO -----
-    pend_total_geral = 0.0
-    pend_list = sorted(pendencias.values(), key=lambda x: x['total'], reverse=True)
-    if pend_list:
-        ws2 = _StreamSheet(wb.create_sheet('PENDÊNCIAS DE CRUZAMENTO'))
-        # Ajustes da aba ANTES de escrever (write_only)
-        for col_idx, w in enumerate([22, 42, 48, 48, 24, 16], start=1):
-            ws2.column_dimensions[get_column_letter(col_idx)].width = w
-        ws2.row_dimensions[1].height = 32
-        ws2.sheet_view.showGridLines = False
-        ws2.freeze_panes = 'A2'
-        pend_header = [
-            'CNPJ', 'Razão Social', '1º CNAE', '2º CNAE',
-            'Valor Total Não Encontrado', 'Qtd Lançamentos',
-        ]
-        for col_idx, name in enumerate(pend_header, start=1):
-            cell = ws2.cell(row=1, column=col_idx, value=name)
-            apply_style(cell, styles['new_header'])
-
-        for i, p in enumerate(pend_list, start=2):
-            ws2.cell(row=i, column=1, value=format_cnpj(p['cnpj']) if p['cnpj'] else '⚠ Sem CNPJ')
-            ws2.cell(row=i, column=2, value=p['nome'] or '(sem identificação)')
-            ws2.cell(row=i, column=3, value=p['cnae1'] or '')
-            ws2.cell(row=i, column=4, value=p['cnae2'] or '')
-            ws2.cell(row=i, column=5, value=round(p['total'], 2))
-            ws2.cell(row=i, column=6, value=p['count'])
-            pend_total_geral += p['total']
-
-            apply_style(ws2.cell(row=i, column=1), styles['info'] if p['cnpj'] else styles['alert'])
-            apply_style(ws2.cell(row=i, column=2), styles['info'])
-            apply_style(ws2.cell(row=i, column=3), styles['info'])
-            apply_style(ws2.cell(row=i, column=4), styles['info'])
-            apply_style(ws2.cell(row=i, column=5), styles['value_warn'])
-            apply_style(ws2.cell(row=i, column=6), styles['info'])
-
-        # Linha de total
-        total_row = len(pend_list) + 2
-        ws2.cell(row=total_row, column=4, value='TOTAL GERAL →')
-        ws2.cell(row=total_row, column=5, value=round(pend_total_geral, 2))
-        ws2.cell(row=total_row, column=6, value=sum(p['count'] for p in pend_list))
-        for c in [4, 5, 6]:
-            apply_style(ws2.cell(row=total_row, column=c), styles['new_header'])
-        ws2.cell(row=total_row, column=5).number_format = '#,##0.00'
-
-        ws2.auto_filter.ref = f'A1:F{len(pend_list) + 1}'
-        ws2.done()  # flush da última linha (total geral)
-
+    # A aba "PENDÊNCIAS DE CRUZAMENTO" foi removida (a pedido) — as linhas não
+    # localizadas já aparecem na aba da Razão (coluna Análise = "Não localizado nos
+    # blocos de crédito"), então a aba consolidada era redundante. Mantemos só os
+    # números pras estatísticas da tela.
+    pend_list = list(pendencias.values())
     stats['pendencias'] = len(pend_list)
-    stats['pendencias_total'] = round(pend_total_geral, 2)
+    stats['pendencias_total'] = round(sum(p['total'] for p in pend_list), 2)
 
     # ----- Abas dos blocos SPED (COMPLETAS, lidas em STREAMING) -----
     # Cada aba traz as colunas-chave fixas no início (usadas pelos SUMIFS) seguidas
