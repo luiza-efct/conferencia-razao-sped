@@ -802,9 +802,22 @@ def _aprender_regra(historico_ex, razao_ex):
     if not rnorm:
         return None
     start = _find_subseq(hnorm, rnorm)
+    fim_rnorm = len(rnorm)
     if start < 0:
-        return None  # exemplo não bate com o histórico colado
-    to_end = (start + len(rnorm)) >= len(hnorm)
+        # Não achou a razão INTEIRA contígua. Tenta localizar pelo 1º nome significativo
+        # (ex: "FUNDO", "CLINISEG") — mais tolerante a nome digitado um pouco diferente.
+        significativos = [w for w in rnorm if w not in _NAME_STOPWORDS and len(w) > 2]
+        ancora = significativos[0] if significativos else (rnorm[0] if rnorm else None)
+        pos = -1
+        if ancora:
+            for j, w in enumerate(hnorm):  # ÚLTIMA ocorrência (nome costuma vir no fim)
+                if w == ancora:
+                    pos = j
+        if pos < 0:
+            return None  # nem a âncora aparece no histórico → não dá pra aprender
+        start = pos
+        fim_rnorm = len(hnorm) - start  # daqui até o fim
+    to_end = (start + fim_rnorm) >= len(hnorm)
     before = raw[toks[start - 1][0]] if start > 0 else ''
     if before and any(c.isdigit() for c in before):
         delim = ('after_last_number',)
@@ -923,12 +936,19 @@ def montar_extrator(estrategia=0, exemplo_historico=None, exemplo_razao=None, ex
                 _f = s['fn']
                 nome_fn = (lambda h, c, _f=_f: _f(h, c))
                 partes.append(f'nome pela leitura "{s["label"]}"')
+                log.info('APRENDER nome: casou com a leitura "%s"', s['label'])
                 break
         if nome_fn is None:
             regra = _aprender_regra(exemplo_historico, exemplo_razao)
             if regra:
                 nome_fn = (lambda h, c, _r=regra: _extract_aprendida(h, c, _r))
                 partes.append('nome por regra própria')
+                log.info('APRENDER nome: regra própria derivada (%s)', regra.get('delim'))
+            else:
+                log.warning('APRENDER nome FALHOU: a razão "%s" não foi encontrada dentro do '
+                            'histórico de exemplo "%s". Confira se o nome digitado está escrito '
+                            'igual ao que aparece no histórico.',
+                            str(exemplo_razao)[:50], str(exemplo_historico)[:70])
     if nome_fn is None:
         _base = EXTRACTION_STRATEGIES[estrategia % len(EXTRACTION_STRATEGIES)]['fn']
         nome_fn = (lambda h, c, _f=_base: _f(h, c))
