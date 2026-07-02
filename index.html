@@ -564,12 +564,13 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
 
 <section class="pattern-confirm" id="patternConfirm" hidden>
   <h2>1. Confira o padrão do Complemento Histórico</h2>
-  <p class="pc-help">Antes de cruzar tudo (o que leva alguns minutos), confira se a ferramenta
-  está lendo certo o <b>número da NF</b> e a <b>razão social</b> do histórico. Se estiver certo,
-  clique <b>“Está certo, processar”</b>. Se não, clique <b>“Repensar padrão”</b> que ela tenta
-  outra forma de leitura.</p>
+  <p class="pc-help">Antes de cruzar tudo (o que leva alguns minutos), confira na tabela abaixo se a
+  ferramenta está lendo certo o <b>número da NF</b> e a <b>razão social</b>. Se algo estiver errado,
+  <b>corrija no exemplo</b> logo abaixo da tabela e clique em <b>“Aprender com meu exemplo”</b> —
+  ela descobre o padrão e <b>reaplica em todas as nomenclaturas</b>, e a tabela atualiza na hora.
+  Quando estiver certo, clique em <b>“Está certo, processar”</b>.</p>
   <div class="pc-strategy">
-    <span class="pc-badge" id="pcBadge">Leitura 1/5</span>
+    <span class="pc-badge" id="pcBadge">Automático</span>
     <div>
       <div class="pc-strat-label" id="pcStratLabel">—</div>
       <div class="pc-strat-desc" id="pcStratDesc">—</div>
@@ -599,7 +600,6 @@ details.howto ul{ margin:4px 0 0 18px; color:var(--texto-2); }
 
   <div class="pc-actions">
     <button id="btnPatternOk" class="primary" type="button">✓ Está certo, processar</button>
-    <button id="btnPatternRethink" class="secondary" type="button">↻ Repensar padrão (outra leitura pronta)</button>
     <button id="btnPatternCancel" class="secondary" type="button">Cancelar</button>
   </div>
 </section>
@@ -779,7 +779,7 @@ async function previewPattern(){
 }
 
 function renderPattern(data){
-  $('#pcBadge').textContent = `Leitura ${data.estrategia_idx + 1}/${data.total_estrategias}`;
+  $('#pcBadge').textContent = data.aprendido ? '✓ Seu exemplo' : 'Automático';
   $('#pcStratLabel').textContent = data.estrategia_label;
   $('#pcStratDesc').textContent = data.estrategia_descricao;
   const linhas = (data.amostras || []).map(a => {
@@ -987,14 +987,6 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#btnProcess').addEventListener('click', () => { CURRENT_STRATEGY = 0; EX_HIST=''; EX_RAZAO=''; EX_NF=''; previewPattern(); });
   // Etapa 2: aprovar o padrão → processa tudo com a leitura escolhida
   $('#btnPatternOk').addEventListener('click', processAll);
-  // Repensar → próxima leitura PRONTA (cicla) e limpa o exemplo aplicado
-  $('#btnPatternRethink').addEventListener('click', () => {
-    EX_HIST = ''; EX_RAZAO = ''; EX_NF = '';
-    if ($('#pcExRazao')) $('#pcExRazao').value = '';
-    if ($('#pcExNf')) $('#pcExNf').value = '';
-    CURRENT_STRATEGY = (CURRENT_STRATEGY + 1) % TOTAL_STRATEGIES;
-    previewPattern();
-  });
   // Aprender com exemplo → usa o histórico + razão e/ou NF corretas digitadas
   $('#btnPatternLearn').addEventListener('click', () => {
     const h = ($('#pcExHist').value || '').trim();
